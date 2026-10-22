@@ -46,6 +46,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 enum UpdateMsg {
     Available(String, String), // (version tag, release url)
     UpToDate,
+    CheckFailed,
 }
 
 fn parse_ver(s: &str) -> (u64, u64, u64) {
@@ -71,7 +72,10 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return, // stay silent offline
+        Err(_) => {
+            send(UpdateMsg::CheckFailed);
+            return;
+        }
     };
     let v: serde_json::Value = match client
         .get(format!(
@@ -81,13 +85,20 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
     {
         Ok(r) if r.status().is_success() => match r.json() {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => {
+                send(UpdateMsg::CheckFailed);
+                return;
+            }
         },
-        _ => return,
+        _ => {
+            send(UpdateMsg::CheckFailed);
+            return;
+        }
     };
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
     let url = v["html_url"].as_str().unwrap_or("").to_string();
     if tag.is_empty() || url.is_empty() {
+        send(UpdateMsg::CheckFailed);
         return;
     }
     if parse_ver(&tag) > parse_ver(APP_VERSION) {
@@ -365,6 +376,13 @@ impl eframe::App for ClosetApp {
                 self.update_info = None;
                 self.update_status = format!("You're up to date (v{APP_VERSION}).");
             }
+            Some(UpdateMsg::CheckFailed) => {
+                // Only report manual checks; the launch check stays silent.
+                if self.update_status == "Checking…" {
+                    self.update_status =
+                        "Couldn't reach GitHub — check your connection and try again.".into();
+                }
+            }
             None => {}
         }
 
@@ -584,13 +602,15 @@ impl eframe::App for ClosetApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label(
-                        "The Utility Closet v1.0\n\n\
-                         All-in-one Windows maintenance:\n\
-                         • Network drive mapping\n\
-                         • System File Checker (sfc /scannow)\n\
-                         • Display cache reset\n\
-                         • Icon cache rebuild\n\n\
-                         Built for Shawn Rodis.",
+                        format!(
+                            "The Utility Closet v{APP_VERSION}\n\n\
+                             All-in-one Windows maintenance:\n\
+                             • Network drive mapping\n\
+                             • System File Checker (sfc /scannow)\n\
+                             • Display cache reset\n\
+                             • Icon cache rebuild\n\n\
+                             Built for Shawn Rodis."
+                        ),
                     );
                     ui.add_space(8.0);
                     if ui.button("Close").clicked() {
