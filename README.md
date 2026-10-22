@@ -8,6 +8,12 @@ Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
 Single `.exe`, no dependencies, no console window. Requests administrator
 rights on launch (every tool needs them).
 
+## Download
+
+Grab the latest `UtilityCloset.exe` from
+[Releases](https://github.com/shawnrodis/UtilityCloset/releases) — no install
+needed, just run it. (Building from source is optional; instructions below.)
+
 ## Features
 
 - **Network Drives** — map/unmap drives with `net use`, output shown live in
@@ -21,7 +27,7 @@ rights on launch (every tool needs them).
 - **Icon Cache** — clears the icon cache, restarts Explorer, offers a reboot.
 - Follows the Windows light/dark app theme. Custom closet icon.
 
-## Build
+## Build from source
 
 On Windows (install Rust via [rustup](https://rustup.rs/) first):
 
