@@ -1,5 +1,9 @@
 # The Utility Closet
 
+<p align="center">
+  <img src="assets/icon.png" alt="UtilityCloset app icon" width="120">
+</p>
+
 An all-in-one Windows maintenance app: network drive mapping, System File
 Checker, display cache reset, and icon cache rebuild — in one small window,
 no bloat.
