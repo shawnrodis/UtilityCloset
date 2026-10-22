@@ -2,7 +2,7 @@
 
 An all-in-one Windows maintenance app: network drive mapping, System File
 Checker, display cache reset, and icon cache rebuild — in one small window,
-no installer, no bloat.
+no bloat.
 
 Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
 Single `.exe`, no dependencies, no console window. Requests administrator
