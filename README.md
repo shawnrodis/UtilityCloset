@@ -10,9 +10,12 @@ rights on launch (every tool needs them).
 
 ## Download
 
-Grab the latest `UtilityCloset.exe` from
-[Releases](https://github.com/shawnrodis/UtilityCloset/releases) — no install
-needed, just run it. (Building from source is optional; instructions below.)
+Grab the latest `UtilityCloset-Setup-vX.Y.Z.exe` installer from
+[Releases](https://github.com/shawnrodis/UtilityCloset/releases) and run it —
+requires administrator (the app needs elevation for SFC/registry work).
+Installs to `%PROGRAMFILES%\UtilityCloset` with Start Menu and desktop
+shortcuts plus an uninstaller. (Building from source is optional; instructions
+below.)
 
 ## Features
 
