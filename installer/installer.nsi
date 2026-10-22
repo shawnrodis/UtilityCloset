@@ -39,6 +39,7 @@ Section "The Utility Closet" SecApp
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayIcon" "$INSTDIR\UtilityCloset.exe"
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "EstimatedSize" 16448
 
   ; Start Menu shortcuts (all users).
   CreateDirectory "$SMPROGRAMS\The Utility Closet"
