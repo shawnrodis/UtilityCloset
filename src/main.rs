@@ -5,7 +5,10 @@
 use eframe::egui;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MAX_DRIVES: usize = 6;
@@ -27,6 +30,78 @@ struct ClosetApp {
     log: String,
     confirm: Option<Confirm>,
     show_about: bool,
+    update_rx: Option<mpsc::Receiver<UpdateMsg>>,
+    update_info: Option<(String, String)>,
+    update_dismissed: bool,
+    update_status: String,
+}
+
+// ---------------------------------------------------------------------------
+// auto update check (GitHub Releases)
+// ---------------------------------------------------------------------------
+
+const UPDATE_REPO: &str = "shawnrodis/UtilityCloset";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+enum UpdateMsg {
+    Available(String, String), // (version tag, release url)
+    UpToDate,
+}
+
+fn parse_ver(s: &str) -> (u64, u64, u64) {
+    let mut it = s
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
+fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("UtilityCloset-update-check")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return, // stay silent offline
+    };
+    let v: serde_json::Value = match client
+        .get(format!(
+            "https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+        ))
+        .send()
+    {
+        Ok(r) if r.status().is_success() => match r.json() {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+    let url = v["html_url"].as_str().unwrap_or("").to_string();
+    if tag.is_empty() || url.is_empty() {
+        return;
+    }
+    if parse_ver(&tag) > parse_ver(APP_VERSION) {
+        send(UpdateMsg::Available(tag, url));
+    } else {
+        send(UpdateMsg::UpToDate);
+    }
+}
+
+fn open_url(url: &str) {
+    let _ = Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 fn timestamp() -> String {
@@ -71,7 +146,15 @@ impl ClosetApp {
             log: String::new(),
             confirm: None,
             show_about: false,
+            update_rx: None,
+            update_info: None,
+            update_dismissed: false,
+            update_status: String::new(),
         };
+        // Check for updates in the background (silent unless one is found).
+        let (utx, urx) = mpsc::channel();
+        app.update_rx = Some(urx);
+        thread::spawn(move || check_updates(utx));
         app.load_config();
         if app.drives.is_empty() {
             app.drives.push(DriveRow {
@@ -265,9 +348,51 @@ impl ClosetApp {
 
 impl eframe::App for ClosetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // poll the background update check
+        let mut got: Option<UpdateMsg> = None;
+        if let Some(rx) = &self.update_rx {
+            while let Ok(m) = rx.try_recv() {
+                got = Some(m);
+            }
+        }
+        match got {
+            Some(UpdateMsg::Available(tag, url)) => {
+                self.update_info = Some((tag, url));
+                self.update_dismissed = false;
+                self.update_status.clear();
+            }
+            Some(UpdateMsg::UpToDate) => {
+                self.update_info = None;
+                self.update_status = format!("You're up to date (v{APP_VERSION}).");
+            }
+            None => {}
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("The Utility Closet");
+
+                // update banner
+                let upd = self.update_info.clone();
+                if let Some((ver, url)) = upd {
+                    if !self.update_dismissed {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Update available: {ver} (you have v{APP_VERSION})"
+                                ))
+                                .strong(),
+                            );
+                            if ui.button("Download").clicked() {
+                                open_url(&url);
+                            }
+                            if ui.button("Dismiss").clicked() {
+                                self.update_dismissed = true;
+                            }
+                        });
+                    }
+                }
+
                 ui.add_space(4.0);
 
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -373,6 +498,17 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
+                    if ui.button("Check for updates").clicked() {
+                        let (tx2, rx2) = mpsc::channel();
+                        self.update_rx = Some(rx2);
+                        self.update_dismissed = false;
+                        self.update_info = None;
+                        self.update_status = "Checking…".into();
+                        thread::spawn(move || check_updates(tx2));
+                    }
+                    if !self.update_status.is_empty() {
+                        ui.label(&self.update_status);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("About").clicked() {
                             self.show_about = true;
