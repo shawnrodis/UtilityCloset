@@ -34,6 +34,7 @@ struct ClosetApp {
     update_info: Option<(String, String)>,
     update_dismissed: bool,
     update_status: String,
+    update_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,10 +162,12 @@ impl ClosetApp {
             update_info: None,
             update_dismissed: false,
             update_status: String::new(),
+            update_pending: false,
         };
         // Check for updates in the background (silent unless one is found).
         let (utx, urx) = mpsc::channel();
         app.update_rx = Some(urx);
+        app.update_pending = true;
         thread::spawn(move || check_updates(utx));
         app.load_config();
         if app.drives.is_empty() {
@@ -359,7 +362,10 @@ impl ClosetApp {
 
 impl eframe::App for ClosetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // poll the background update check
+        // poll the background update check; keep repainting until it lands
+        if self.update_pending {
+            ctx.request_repaint();
+        }
         let mut got: Option<UpdateMsg> = None;
         if let Some(rx) = &self.update_rx {
             while let Ok(m) = rx.try_recv() {
@@ -371,12 +377,15 @@ impl eframe::App for ClosetApp {
                 self.update_info = Some((tag, url));
                 self.update_dismissed = false;
                 self.update_status.clear();
+                self.update_pending = false;
             }
             Some(UpdateMsg::UpToDate) => {
                 self.update_info = None;
                 self.update_status = format!("You're up to date (v{APP_VERSION}).");
+                self.update_pending = false;
             }
             Some(UpdateMsg::CheckFailed) => {
+                self.update_pending = false;
                 // Only report manual checks; the launch check stays silent.
                 if self.update_status == "Checking…" {
                     self.update_status =
@@ -522,6 +531,7 @@ impl eframe::App for ClosetApp {
                         self.update_dismissed = false;
                         self.update_info = None;
                         self.update_status = "Checking…".into();
+                        self.update_pending = true;
                         thread::spawn(move || check_updates(tx2));
                     }
                     if !self.update_status.is_empty() {
