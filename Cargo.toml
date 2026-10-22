@@ -1,0 +1,9 @@
+[package]
+name = "utility-closet"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+chrono = "0.4"
