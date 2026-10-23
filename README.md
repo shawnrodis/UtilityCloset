@@ -12,6 +12,13 @@ Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
 Single `.exe`, no dependencies, no console window. Requests administrator
 rights on launch (every tool needs them).
 
+## Screenshot
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="The Utility Closet main window: Network Drives, System File Checker, Display Cache, Icon Cache, and the log" width="520">
+  <br><em>Everything in one small window — drives, SFC, both cache tools, and a live log.</em>
+</p>
+
 ## Download
 
 Grab the latest `UtilityCloset-Setup-vX.Y.Z.exe` installer from
