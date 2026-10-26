@@ -27,27 +27,44 @@ enum Confirm {
 
 struct ClosetApp {
     drives: Vec<DriveRow>,
+    printers: Vec<String>,
+    printer_path: String,
+    selected_printer: Option<usize>,
     log: String,
     confirm: Option<Confirm>,
     show_about: bool,
     update_rx: Option<mpsc::Receiver<UpdateMsg>>,
-    update_info: Option<(String, String)>,
+    update_info: Option<ReleaseInfo>,
     update_dismissed: bool,
     update_status: String,
     update_pending: bool,
+    update_downloading: bool,
+    update_progress: (u64, u64),
 }
 
 // ---------------------------------------------------------------------------
-// auto update check (GitHub Releases)
+// auto update (Tuya-style: download installer + run it, no browser)
 // ---------------------------------------------------------------------------
 
 const UPDATE_REPO: &str = "shawnrodis/UtilityCloset";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A release asset this app installs from.
+#[derive(Clone)]
+struct ReleaseInfo {
+    version: String,    // e.g. "1.0.5" (tag without the 'v')
+    asset_name: String, // e.g. "UtilityCloset-Setup-v1.0.5.exe"
+    asset_url: String,  // browser_download_url
+    asset_size: u64,
+}
+
 enum UpdateMsg {
-    Available(String, String), // (version tag, release url)
+    Available(ReleaseInfo),
     UpToDate,
     CheckFailed,
+    DownloadProgress(u64, u64), // (bytes got, total)
+    Downloaded(std::path::PathBuf),
+    DownloadFailed,
 }
 
 fn parse_ver(s: &str) -> (u64, u64, u64) {
@@ -61,6 +78,12 @@ fn parse_ver(s: &str) -> (u64, u64, u64) {
         it.next().unwrap_or(0),
         it.next().unwrap_or(0),
     )
+}
+
+/// The installer asset name for a version — exact match, same strictness
+/// as the Tuya app's select_update_asset.
+fn expected_asset_name(version: &str) -> String {
+    format!("UtilityCloset-Setup-v{version}.exe")
 }
 
 fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
@@ -97,23 +120,106 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
         }
     };
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    let url = v["html_url"].as_str().unwrap_or("").to_string();
-    if tag.is_empty() || url.is_empty() {
+    if tag.is_empty() {
         send(UpdateMsg::CheckFailed);
         return;
     }
-    if parse_ver(&tag) > parse_ver(APP_VERSION) {
-        send(UpdateMsg::Available(tag, url));
-    } else {
+    if parse_ver(&tag) <= parse_ver(APP_VERSION) {
         send(UpdateMsg::UpToDate);
+        return;
+    }
+    // Newer version — find this platform's installer asset by exact name.
+    let version = tag.trim_start_matches('v').to_string();
+    let want = expected_asset_name(&version);
+    let assets = v["assets"].as_array().cloned().unwrap_or_default();
+    let asset = assets.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n == want)
+            .unwrap_or(false)
+    });
+    match asset {
+        Some(a) => {
+            let url = a
+                .get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            let size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            if url.is_empty() {
+                send(UpdateMsg::CheckFailed);
+            } else {
+                send(UpdateMsg::Available(ReleaseInfo {
+                    version,
+                    asset_name: want,
+                    asset_url: url,
+                    asset_size: size,
+                }));
+            }
+        }
+        None => send(UpdateMsg::CheckFailed),
     }
 }
 
-fn open_url(url: &str) {
-    let _ = Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+/// Download the installer to %TEMP%, reporting progress. Verifies the
+/// file name matches the expected asset before reporting success.
+fn download_update(info: ReleaseInfo, tx: mpsc::Sender<UpdateMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent("UtilityCloset-update-download")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let mut resp = match client.get(&info.asset_url).send() {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let total = resp.content_length().unwrap_or(info.asset_size);
+    let dest = std::env::temp_dir().join(&info.asset_name);
+    let mut file = match std::fs::File::create(&dest) {
+        Ok(f) => f,
+        Err(_) => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let mut got: u64 = 0;
+    let mut buf = [0u8; 8192];
+    use std::io::Read;
+    use std::io::Write;
+    loop {
+        match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if file.write_all(&buf[..n]).is_err() {
+                    send(UpdateMsg::DownloadFailed);
+                    return;
+                }
+                got += n as u64;
+                let _ = tx.send(UpdateMsg::DownloadProgress(got, total));
+            }
+            Err(_) => {
+                send(UpdateMsg::DownloadFailed);
+                return;
+            }
+        }
+    }
+    // Verify the file exists and is non-empty before handing it off.
+    match std::fs::metadata(&dest) {
+        Ok(m) if m.len() > 0 => send(UpdateMsg::Downloaded(dest)),
+        _ => send(UpdateMsg::DownloadFailed),
+    }
 }
 
 fn timestamp() -> String {
@@ -155,6 +261,9 @@ impl ClosetApp {
         });
         let mut app = Self {
             drives: Vec::new(),
+            printers: Vec::new(),
+            printer_path: String::new(),
+            selected_printer: None,
             log: String::new(),
             confirm: None,
             show_about: false,
@@ -163,6 +272,8 @@ impl ClosetApp {
             update_dismissed: false,
             update_status: String::new(),
             update_pending: false,
+            update_downloading: false,
+            update_progress: (0, 0),
         };
         // Check for updates in the background (silent unless one is found).
         let (utx, urx) = mpsc::channel();
@@ -358,6 +469,101 @@ impl ClosetApp {
             .spawn();
         self.log_line("Explorer restarted. Icon cache will rebuild.");
     }
+
+    // -----------------------------------------------------------------------
+    // Printers (network printer add/remove, below Network Drives)
+    // -----------------------------------------------------------------------
+
+    /// Refresh the installed-printer list via PowerShell.
+    fn refresh_printers(&mut self) {
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Printer | Select-Object -ExpandProperty Name",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                self.printers = text
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                self.selected_printer = None;
+                self.log_line(&format!(
+                    "Found {} installed printer(s).",
+                    self.printers.len()
+                ));
+            }
+            Err(e) => {
+                self.log_line(&format!("Failed to list printers: {e}"));
+            }
+        }
+    }
+
+    /// Add a network printer by UNC path (e.g. \\SERVER\Printer).
+    fn add_printer(&mut self) {
+        let path = self.printer_path.trim().to_string();
+        if path.is_empty() {
+            self.log_line("Enter a printer path first (e.g. \\\\SERVER\\Printer).");
+            return;
+        }
+        self.log_line(&format!("Adding printer {path} ..."));
+        let ok = self.run_logged(
+            "rundll32",
+            &[
+                "printui.dll,PrintUIEntry",
+                "/in",
+                "/n",
+                &path,
+            ],
+        );
+        if ok {
+            self.log_line(&format!("Printer {path} added."));
+            self.printer_path.clear();
+            self.refresh_printers();
+        } else {
+            self.log_line(
+                "Add may have failed — check the path and that the print server is reachable.",
+            );
+        }
+    }
+
+    /// Remove the selected printer.
+    fn remove_printer(&mut self) {
+        let Some(idx) = self.selected_printer else {
+            self.log_line("Select a printer from the list first.");
+            return;
+        };
+        let Some(name) = self.printers.get(idx).cloned() else {
+            return;
+        };
+        self.log_line(&format!("Removing printer {name} ..."));
+        self.run_logged(
+            "rundll32",
+            &["printui.dll,PrintUIEntry", "/dl", "/n", &name],
+        );
+        self.refresh_printers();
+    }
+
+    /// Set the selected printer as default.
+    fn set_default_printer(&mut self) {
+        let Some(idx) = self.selected_printer else {
+            self.log_line("Select a printer from the list first.");
+            return;
+        };
+        let Some(name) = self.printers.get(idx).cloned() else {
+            return;
+        };
+        self.log_line(&format!("Setting {name} as default printer ..."));
+        self.run_logged(
+            "rundll32",
+            &["printui.dll,PrintUIEntry", "/y", "/n", &name],
+        );
+    }
 }
 
 impl eframe::App for ClosetApp {
@@ -373,11 +579,12 @@ impl eframe::App for ClosetApp {
             }
         }
         match got {
-            Some(UpdateMsg::Available(tag, url)) => {
-                self.update_info = Some((tag, url));
+            Some(UpdateMsg::Available(info)) => {
+                self.update_info = Some(info);
                 self.update_dismissed = false;
                 self.update_status.clear();
                 self.update_pending = false;
+                self.update_downloading = false;
             }
             Some(UpdateMsg::UpToDate) => {
                 self.update_info = None;
@@ -392,6 +599,30 @@ impl eframe::App for ClosetApp {
                         "Couldn't reach GitHub — check your connection and try again.".into();
                 }
             }
+            Some(UpdateMsg::DownloadProgress(got_bytes, total)) => {
+                self.update_progress = (got_bytes, total);
+                ctx.request_repaint();
+            }
+            Some(UpdateMsg::Downloaded(path)) => {
+                self.update_downloading = false;
+                self.update_status = format!(
+                    "Downloaded {} — launching installer…",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
+                // Run the installer, then exit so it can replace us
+                // (Tuya-style: the installer handles the upgrade).
+                let _ = Command::new(&path)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::process::exit(0);
+            }
+            Some(UpdateMsg::DownloadFailed) => {
+                self.update_downloading = false;
+                self.update_status = "Download failed — check your connection and try again.".into();
+            }
             None => {}
         }
 
@@ -401,17 +632,38 @@ impl eframe::App for ClosetApp {
 
                 // update banner
                 let upd = self.update_info.clone();
-                if let Some((ver, url)) = upd {
+                if let Some(info) = upd {
                     if !self.update_dismissed {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Update available: {ver} (you have v{APP_VERSION})"
+                                    "Update available: v{} (you have v{APP_VERSION})",
+                                    info.version
                                 ))
                                 .strong(),
                             );
-                            if ui.button("Download").clicked() {
-                                open_url(&url);
+                            if self.update_downloading {
+                                let (got_b, total_b) = self.update_progress;
+                                let pct = if total_b > 0 {
+                                    got_b as f32 / total_b as f32 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                ui.label(format!(
+                                    "Downloading… {:.0}% ({:.1} / {:.1} MB)",
+                                    pct,
+                                    got_b as f32 / 1_048_576.0,
+                                    total_b as f32 / 1_048_576.0
+                                ));
+                            } else if ui.button("Download & Install").clicked() {
+                                // Tuya-style: download the installer, run
+                                // it, exit so it can replace us.
+                                self.update_downloading = true;
+                                self.update_progress = (0, info.asset_size);
+                                let (tx2, rx2) = mpsc::channel();
+                                self.update_rx = Some(rx2);
+                                let info2 = info.clone();
+                                thread::spawn(move || download_update(info2, tx2));
                             }
                             if ui.button("Dismiss").clicked() {
                                 self.update_dismissed = true;
@@ -464,6 +716,48 @@ impl eframe::App for ClosetApp {
                     ui.label(
                         "Paths start blank — enter yours. Add as many drives as you like; \
                          the list is saved automatically.",
+                    );
+                });
+
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Printers").strong());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.printer_path)
+                                .desired_width(360.0)
+                                .hint_text(r"\\SERVER\Printer"),
+                        );
+                        if ui.button("Add Printer").clicked() {
+                            self.add_printer();
+                        }
+                        if ui.button("Refresh List").clicked() {
+                            self.refresh_printers();
+                        }
+                    });
+                    if !self.printers.is_empty() {
+                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                            for (i, name) in self.printers.iter().enumerate() {
+                                let selected = self.selected_printer == Some(i);
+                                if ui.selectable_label(selected, name).clicked() {
+                                    self.selected_printer = Some(i);
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Set as Default").clicked() {
+                                self.set_default_printer();
+                            }
+                            if ui.button("Remove Printer").clicked() {
+                                self.remove_printer();
+                            }
+                        });
+                    } else {
+                        ui.label("No printers listed — click Refresh List to load them.");
+                    }
+                    ui.label(
+                        "Add a network printer by its UNC path (e.g. \\\\SERVER\\Printer). \
+                         Select a printer from the list to set it as default or remove it.",
                     );
                 });
 
@@ -616,6 +910,7 @@ impl eframe::App for ClosetApp {
                             "The Utility Closet v{APP_VERSION}\n\n\
                              All-in-one Windows maintenance:\n\
                              • Network drive mapping\n\
+                             • Printer add/remove\n\
                              • System File Checker (sfc /scannow)\n\
                              • Display cache reset\n\
                              • Icon cache rebuild\n\n\
