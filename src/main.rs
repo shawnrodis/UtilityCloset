@@ -12,9 +12,14 @@ use std::time::Duration;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MAX_DRIVES: usize = 6;
+const MAX_PRINTERS: usize = 6;
 
 struct DriveRow {
     letter: String,
+    path: String,
+}
+
+struct PrinterRow {
     path: String,
 }
 
@@ -27,8 +32,8 @@ enum Confirm {
 
 struct ClosetApp {
     drives: Vec<DriveRow>,
+    printer_rows: Vec<PrinterRow>,
     printers: Vec<String>,
-    printer_path: String,
     selected_printer: Option<usize>,
     log: String,
     confirm: Option<Confirm>,
@@ -261,8 +266,8 @@ impl ClosetApp {
         });
         let mut app = Self {
             drives: Vec::new(),
+            printer_rows: vec![PrinterRow { path: String::new() }],
             printers: Vec::new(),
-            printer_path: String::new(),
             selected_printer: None,
             log: String::new(),
             confirm: None,
@@ -291,7 +296,7 @@ impl ClosetApp {
                 path: String::new(),
             });
         }
-        app.log_line("The Utility Closet started (running as Administrator).");
+        app.log_line("Utility Closet started (running as Administrator).");
         app
     }
 
@@ -505,30 +510,36 @@ impl ClosetApp {
     }
 
     /// Add a network printer by UNC path (e.g. \\SERVER\Printer).
-    fn add_printer(&mut self) {
-        let path = self.printer_path.trim().to_string();
-        if path.is_empty() {
+    /// Add every printer row with a non-empty path (bulk, like Map Drives).
+    fn add_printers(&mut self) {
+        let rows: Vec<String> = self
+            .printer_rows
+            .iter()
+            .map(|r| r.path.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if rows.is_empty() {
             self.log_line("Enter a printer path first (e.g. \\\\SERVER\\Printer).");
             return;
         }
-        self.log_line(&format!("Adding printer {path} ..."));
-        let ok = self.run_logged(
-            "rundll32",
-            &[
-                "printui.dll,PrintUIEntry",
-                "/in",
-                "/n",
-                &path,
-            ],
-        );
-        if ok {
-            self.log_line(&format!("Printer {path} added."));
-            self.printer_path.clear();
-            self.refresh_printers();
-        } else {
-            self.log_line(
-                "Add may have failed — check the path and that the print server is reachable.",
+        let mut added = 0;
+        for path in &rows {
+            self.log_line(&format!("Adding printer {path} ..."));
+            let ok = self.run_logged(
+                "rundll32",
+                &["printui.dll,PrintUIEntry", "/in", "/n", path],
             );
+            if ok {
+                self.log_line(&format!("Printer {path} added."));
+                added += 1;
+            } else {
+                self.log_line(
+                    "Add may have failed \u{2014} check the path and that the print server is reachable.",
+                );
+            }
+        }
+        if added > 0 {
+            self.refresh_printers();
         }
     }
 
@@ -628,7 +639,7 @@ impl eframe::App for ClosetApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("The Utility Closet");
+                ui.heading("Utility Closet");
 
                 // update banner
                 let upd = self.update_info.clone();
@@ -722,19 +733,40 @@ impl eframe::App for ClosetApp {
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new("Printers").strong());
+                    // Bulk-add rows, just like Network Drives: queue up
+                    // paths, then add them all at once.
+                    let mut remove_idx: Option<usize> = None;
+                    for (i, row) in self.printer_rows.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut row.path)
+                                    .desired_width(360.0)
+                                    .hint_text(r"\\SERVER\Printer"),
+                            );
+                            if ui.button("Remove").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_idx {
+                        self.printer_rows.remove(i);
+                    }
+                    let (mut do_add_row, mut do_add_all, mut do_refresh) =
+                        (false, false, false);
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.printer_path)
-                                .desired_width(360.0)
-                                .hint_text(r"\\SERVER\Printer"),
-                        );
-                        if ui.button("Add Printer").clicked() {
-                            self.add_printer();
-                        }
-                        if ui.button("Refresh List").clicked() {
-                            self.refresh_printers();
-                        }
+                        do_add_row = ui.button("Add Printer").clicked();
+                        do_add_all = ui.button("Add Printers").clicked();
+                        do_refresh = ui.button("Refresh List").clicked();
                     });
+                    if do_add_row && self.printer_rows.len() < MAX_PRINTERS {
+                        self.printer_rows.push(PrinterRow { path: String::new() });
+                    }
+                    if do_add_all {
+                        self.add_printers();
+                    }
+                    if do_refresh {
+                        self.refresh_printers();
+                    }
                     if !self.printers.is_empty() {
                         egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
                             for (i, name) in self.printers.iter().enumerate() {
@@ -756,8 +788,8 @@ impl eframe::App for ClosetApp {
                         ui.label("No printers listed — click Refresh List to load them.");
                     }
                     ui.label(
-                        "Add a network printer by its UNC path (e.g. \\\\SERVER\\Printer). \
-                         Select a printer from the list to set it as default or remove it.",
+                        "Queue up printer paths, then Add Printers adds them all at once. \
+                         Select a printer from the list below to set it as default or remove it.",
                     );
                 });
 
@@ -900,14 +932,14 @@ impl eframe::App for ClosetApp {
 
         // about modal
         if self.show_about {
-            egui::Window::new("About The Utility Closet")
+            egui::Window::new("About Utility Closet")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label(
                         format!(
-                            "The Utility Closet v{APP_VERSION}\n\n\
+                            "Utility Closet v{APP_VERSION}\n\n\
                              All-in-one Windows maintenance:\n\
                              • Network drive mapping\n\
                              • Printer add/remove\n\
@@ -928,7 +960,7 @@ impl eframe::App for ClosetApp {
 
 fn main() {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("The Utility Closet")
+        .with_title("Utility Closet")
         .with_inner_size([660.0, 800.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(Arc::new(icon));
@@ -938,7 +970,7 @@ fn main() {
         ..Default::default()
     };
     let _ = eframe::run_native(
-        "The Utility Closet",
+        "Utility Closet",
         options,
         Box::new(|cc| Box::new(ClosetApp::new(cc))),
     );
