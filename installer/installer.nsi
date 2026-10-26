@@ -1,9 +1,9 @@
-; The Utility Closet installer (NSIS 3.x)
+; Utility Closet installer (NSIS 3.x)
 ; Requires administrator (the app itself needs elevation for SFC/registry work).
 ; Installs to %PROGRAMFILES%\UtilityCloset.
 
-!define APP_NAME "The Utility Closet"
-!define APP_VERSION "1.0.6"
+!define APP_NAME "Utility Closet"
+!define APP_VERSION "1.0.7"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/UtilityCloset"
 
@@ -20,13 +20,13 @@ ShowInstDetails show
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\UtilityCloset.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "Launch The Utility Closet"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
-Section "The Utility Closet" SecApp
+Section "${APP_NAME}" SecApp
   SectionIn RO  ; required — cannot be unchecked
   SetOutPath "$INSTDIR"
   File "UtilityCloset.exe"
@@ -42,13 +42,23 @@ Section "The Utility Closet" SecApp
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "EstimatedSize" 16448
 
   ; Start Menu shortcuts (all users).
-  CreateDirectory "$SMPROGRAMS\The Utility Closet"
-  CreateShortcut "$SMPROGRAMS\The Utility Closet\The Utility Closet.lnk" "$INSTDIR\UtilityCloset.exe"
-  CreateShortcut "$SMPROGRAMS\The Utility Closet\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+  CreateDirectory "$SMPROGRAMS\${APP_NAME}"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\UtilityCloset.exe"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+
+  ; Clean up the pre-rename shortcuts (v1.0.6 and earlier used
+  ; "The Utility Closet") so upgraders don't keep stale icons.
+  Delete "$SMPROGRAMS\The Utility Closet\*.lnk"
+  RMDir "$SMPROGRAMS\The Utility Closet"
+  ; Also here (not only in the Desktop Icon section) so the old
+  ; desktop shortcut is cleaned up even if that component is unchecked.
+  Delete "$DESKTOP\The Utility Closet.lnk"
 SectionEnd
 
 Section "Desktop Icon" SecDesktop
-  CreateShortcut "$DESKTOP\The Utility Closet.lnk" "$INSTDIR\UtilityCloset.exe"
+  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\UtilityCloset.exe"
+  ; Clean up the pre-rename desktop shortcut.
+  Delete "$DESKTOP\The Utility Closet.lnk"
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -63,9 +73,14 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset"
 
-  Delete "$SMPROGRAMS\The Utility Closet\The Utility Closet.lnk"
-  Delete "$SMPROGRAMS\The Utility Closet\Uninstall.lnk"
-  RMDir "$SMPROGRAMS\The Utility Closet"
+  Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\${APP_NAME}"
 
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+
+  ; Pre-rename (v1.0.6 and earlier) shortcuts, in case they survive.
+  Delete "$SMPROGRAMS\The Utility Closet\*.lnk"
+  RMDir "$SMPROGRAMS\The Utility Closet"
   Delete "$DESKTOP\The Utility Closet.lnk"
 SectionEnd

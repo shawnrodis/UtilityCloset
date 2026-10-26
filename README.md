@@ -39,6 +39,27 @@ below.)
   (`GraphicsDrivers\{Configuration, Connectivity, ScaleFactors}`). Restart
   required afterwards.
 - **Icon Cache** — clears the icon cache, restarts Explorer, offers a reboot.
+- **Forced Shutdown** — a toggle that changes what Windows' own Shut down /
+  Restart buttons do: on, Windows ends blocking apps itself after about
+  2 seconds instead of showing the "apps are preventing shutdown" warning;
+  off, the warning comes back. Applies immediately, no reboot needed.
+  Warning: with it on, unsaved work in open apps can be lost.
+- **Windows Welcome Experience** — a toggle that turns off the white
+  post-update setup screen ("Let's finish setting up your device" /
+  "Get even more out of Windows") with its OneDrive backup and
+  Microsoft 365 prompts. Note: Microsoft can reintroduce new prompts in
+  major updates, so this suppresses the current screen rather than
+  guaranteeing it never returns in any future form.
+- **Always Show All Tray Icons** — a toggle that stops Windows hiding
+  system-tray icons in the overflow menu behind the up-arrow, so every
+  notification-area icon stays visible on the taskbar. Applying it
+  restarts Explorer (the taskbar briefly disappears and comes back).
+  Caveat: on Windows 11 some apps' per-app overflow settings can still
+  override this, so it is the closest thing to a global switch, not a
+  guaranteed override for every app.
+- Shortcuts are named "Utility Closet" (not "The Utility Closet") on the
+  desktop and in the Start Menu; installing v1.0.7 also removes the old
+  "The Utility Closet" shortcuts.
 - Follows the Windows light/dark app theme. Custom closet icon.
 
 ## Build from source

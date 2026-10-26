@@ -35,6 +35,9 @@ struct ClosetApp {
     printer_rows: Vec<PrinterRow>,
     printers: Vec<String>,
     selected_printer: Option<usize>,
+    forced_shutdown: bool,
+    welcome_experience: bool,
+    show_all_tray_icons: bool,
     log: String,
     confirm: Option<Confirm>,
     show_about: bool,
@@ -257,6 +260,184 @@ fn is_dark_mode() -> bool {
     }
 }
 
+/// Forced shutdown: HKCU\Control Panel\Desktop values that decide whether
+/// Windows' own Shut down / Restart buttons stop at the "apps are
+/// preventing shutdown" warning or end blocking apps themselves.
+/// ON:  AutoEndTasks=1, WaitToKillAppTimeout=2000, HungAppTimeout=2000
+/// OFF: AutoEndTasks=0, WaitToKillAppTimeout=20000, HungAppTimeout=5000
+/// (the Windows defaults). Read on launch so the toggle always shows
+/// the real system state, not a saved guess.
+const DESKTOP_KEY: &str = r"HKCU\Control Panel\Desktop";
+
+fn is_forced_shutdown() -> bool {
+    let out = Command::new("reg")
+        .args(["query", DESKTOP_KEY, "/v", "AutoEndTasks"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| l.contains("AutoEndTasks") && l.split_whitespace().last() == Some("1")),
+        Err(_) => false,
+    }
+}
+
+fn apply_forced_shutdown(on: bool) -> bool {
+    let (auto_end, kill_app, hung) = if on {
+        ("1", "2000", "2000")
+    } else {
+        ("0", "20000", "5000")
+    };
+    let values = [
+        ("AutoEndTasks", auto_end),
+        ("WaitToKillAppTimeout", kill_app),
+        ("HungAppTimeout", hung),
+    ];
+    let mut ok = true;
+    for (name, value) in values {
+        let status = Command::new("reg")
+            .args([
+                "add", DESKTOP_KEY, "/v", name, "/t", "REG_SZ", "/d", value, "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Windows welcome experience (the post-update "Let's finish setting
+/// up your device" / "Get even more out of Windows" screen with OneDrive
+/// backup, Microsoft 365, etc. prompts).
+/// OFF (suppressed): all three DWORDs below = 0.
+/// ON (allowed):    all three DWORDs = 1, so the state is explicit and
+/// readable. On launch, ScoobeSystemSettingEnabled is the read switch:
+/// 0 = off, 1 or missing = on (the Windows default).
+fn is_welcome_experience_on() -> bool {
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement",
+            "/v",
+            "ScoobeSystemSettingEnabled",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            // Bind the lossy text first: the line borrows from it, so
+            // it must outlive the find() call (E0716 if inlined).
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text
+                .lines()
+                .find(|l| l.contains("ScoobeSystemSettingEnabled"));
+            match line.and_then(|l| l.split_whitespace().last()) {
+                Some("0") | Some("0x0") => false,
+                _ => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+fn apply_welcome_experience(on: bool) -> bool {
+    let value = if on { "1" } else { "0" };
+    let values = [
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement",
+            "ScoobeSystemSettingEnabled",
+        ),
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+            "SubscribedContent-310093Enabled",
+        ),
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+            "SoftLandingEnabled",
+        ),
+    ];
+    let mut ok = true;
+    for (key, name) in values {
+        let status = Command::new("reg")
+            .args([
+                "add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Always show all tray icons (notification area): Windows 11 removed
+/// the old global checkbox and only offers per-app Taskbar corner
+/// overflow toggles, so this is the closest thing to one global switch.
+/// Polarity (web guides conflict on this — this is the semantic
+/// definition used here):
+///   EnableAutoTray = 0 disables "automatically hide inactive tray
+///     icons", i.e. icons stay visible; = 1 is the normal hiding.
+///   NoAutoTrayNotify = 1 is the "Turn off notification area cleanup"
+///     policy value; = 0 is normal.
+/// Show-all ON:  EnableAutoTray=0, NoAutoTrayNotify=1.
+/// Show-all OFF: EnableAutoTray=1, NoAutoTrayNotify=0.
+/// On launch, EnableAutoTray is the read switch: 0 = show-all on,
+/// 1 or missing = normal. Needs an Explorer restart to take effect.
+fn is_show_all_tray_icons() -> bool {
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer",
+            "/v",
+            "EnableAutoTray",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text.lines().find(|l| l.contains("EnableAutoTray"));
+            match line.and_then(|l| l.split_whitespace().last()) {
+                Some("0") | Some("0x0") => true,
+                _ => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+fn apply_show_all_tray_icons(on: bool) -> bool {
+    let (auto_tray, no_notify) = if on { ("0", "1") } else { ("1", "0") };
+    let values = [
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer",
+            "EnableAutoTray",
+            auto_tray,
+        ),
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
+            "NoAutoTrayNotify",
+            no_notify,
+        ),
+    ];
+    let mut ok = true;
+    for (key, name, value) in values {
+        let status = Command::new("reg")
+            .args([
+                "add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            ok = false;
+        }
+    }
+    ok
+}
+
 impl ClosetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(if is_dark_mode() {
@@ -269,6 +450,9 @@ impl ClosetApp {
             printer_rows: vec![PrinterRow { path: String::new() }],
             printers: Vec::new(),
             selected_printer: None,
+            forced_shutdown: false,
+            welcome_experience: true,
+            show_all_tray_icons: false,
             log: String::new(),
             confirm: None,
             show_about: false,
@@ -286,6 +470,11 @@ impl ClosetApp {
         app.update_pending = true;
         thread::spawn(move || check_updates(utx));
         app.load_config();
+        // Forced-shutdown toggle reflects the real registry state, not
+        // a saved setting (another tool could have changed it).
+        app.forced_shutdown = is_forced_shutdown();
+        app.welcome_experience = is_welcome_experience_on();
+        app.show_all_tray_icons = is_show_all_tray_icons();
         if app.drives.is_empty() {
             app.drives.push(DriveRow {
                 letter: "X".into(),
@@ -837,6 +1026,153 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Windows Annoyances").strong(),
+                    );
+                    // Applies immediately on click — no separate Apply
+                    // button. If writing the registry fails, revert the
+                    // toggle so it never claims a state it didn't set.
+                    if ui
+                        .checkbox(
+                            &mut self.forced_shutdown,
+                            "Force shutdown / restart (no warning)",
+                        )
+                        .changed()
+                    {
+                        let on = self.forced_shutdown;
+                        if apply_forced_shutdown(on) {
+                            if on {
+                                self.log_line(
+                                    "Forced shutdown ON: Windows will end open apps itself \
+                                     after about 2 seconds instead of showing the \
+                                     \"apps are preventing shutdown\" warning.",
+                                );
+                            } else {
+                                self.log_line(
+                                    "Forced shutdown OFF: Windows will show the \
+                                     \"apps are preventing shutdown\" warning again.",
+                                );
+                            }
+                        } else {
+                            self.forced_shutdown = !on;
+                            self.log_line(
+                                "Failed to change the forced-shutdown setting — \
+                                 the toggle was left unchanged.",
+                            );
+                        }
+                    }
+                    ui.label(
+                        "Changes what Windows' own Shut down / Restart buttons do: \
+                         with this on, Windows ends blocking apps itself instead of \
+                         stopping at the warning. Applies immediately — no reboot \
+                         needed — and takes effect the next time Windows is told \
+                         to shut down or restart.",
+                    );
+                    ui.label(
+                        "Warning: with this on, unsaved work in open apps can be \
+                         lost, because Windows will no longer stop and ask.",
+                    );
+                    ui.add_space(6.0);
+                    // Same immediate-apply, revert-on-failure pattern as
+                    // the forced-shutdown toggle above.
+                    if ui
+                        .checkbox(
+                            &mut self.welcome_experience,
+                            "Windows welcome experience after updates",
+                        )
+                        .changed()
+                    {
+                        let on = self.welcome_experience;
+                        if apply_welcome_experience(on) {
+                            if on {
+                                self.log_line(
+                                    "Windows welcome experience ON: the post-update \
+                                     setup screen may appear again.",
+                                );
+                            } else {
+                                self.log_line(
+                                    "Windows welcome experience OFF: the post-update \
+                                     setup screen is suppressed.",
+                                );
+                            }
+                        } else {
+                            self.welcome_experience = !on;
+                            self.log_line(
+                                "Failed to change the welcome-experience setting — \
+                                 the toggle was left unchanged.",
+                            );
+                        }
+                    }
+                    ui.label(
+                        "This is the white post-update setup screen (\"Let's finish \
+                         setting up your device\" / \"Get even more out of Windows\") \
+                         with OneDrive backup, Microsoft 365, and similar prompts. \
+                         Turning it off suppresses that screen.",
+                    );
+                    ui.label(
+                        "Note: Microsoft can reintroduce new prompts in major \
+                         updates, so this suppresses the current screen rather than \
+                         guaranteeing it never returns in any future form.",
+                    );
+                    ui.add_space(6.0);
+                    // Same immediate-apply, revert-on-failure pattern as
+                    // the toggles above, plus the Explorer restart this
+                    // change needs (same pattern as the icon-cache tool).
+                    if ui
+                        .checkbox(
+                            &mut self.show_all_tray_icons,
+                            "Always show all taskbar tray icons",
+                        )
+                        .changed()
+                    {
+                        let on = self.show_all_tray_icons;
+                        if apply_show_all_tray_icons(on) {
+                            if on {
+                                self.log_line(
+                                    "Show all tray icons ON: notification-area icons \
+                                     will no longer hide in the overflow menu.",
+                                );
+                            } else {
+                                self.log_line(
+                                    "Show all tray icons OFF: Windows will hide \
+                                     inactive tray icons in the overflow menu again.",
+                                );
+                            }
+                            self.log_line(
+                                "Restarting Explorer so the taskbar picks this up \
+                                 (the taskbar will briefly disappear and come back).",
+                            );
+                            let _ = Command::new("taskkill")
+                                .args(["/IM", "explorer.exe", "/F"])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            let _ = Command::new("explorer.exe")
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .spawn();
+                        } else {
+                            self.show_all_tray_icons = !on;
+                            self.log_line(
+                                "Failed to change the tray-icons setting — \
+                                 the toggle was left unchanged.",
+                            );
+                        }
+                    }
+                    ui.label(
+                        "Stops Windows hiding system-tray icons in the overflow \
+                         menu behind the up-arrow, so every notification-area icon \
+                         stays visible on the taskbar. Applying this restarts \
+                         Explorer — the taskbar will briefly disappear and come back.",
+                    );
+                    ui.label(
+                        "Caveat: on Windows 11 some apps' per-app overflow settings \
+                         can still override this, so it is the closest thing to a \
+                         global switch, not a guaranteed override for every app.",
+                    );
+                });
+
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new("Log").strong());
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                         ui.add(
@@ -945,7 +1281,10 @@ impl eframe::App for ClosetApp {
                              • Printer add/remove\n\
                              • System File Checker (sfc /scannow)\n\
                              • Display cache reset\n\
-                             • Icon cache rebuild\n\n\
+                             • Icon cache rebuild\n\
+                             • Forced shutdown toggle\n\
+                             • Windows welcome experience toggle\n\
+                             • Always show all tray icons toggle\n\n\
                              Built for Shawn Rodis."
                         ),
                     );
