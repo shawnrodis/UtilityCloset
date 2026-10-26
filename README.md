@@ -31,10 +31,17 @@ below.)
 ## Features
 
 - **Network Drives** — map/unmap drives with `net use`, output shown live in
-  the log. Drive letters prefilled, paths start blank. Add up to 6 drives;
-  the list is saved to `UtilityCloset.ini` next to the exe and restored on
-  launch.
+  the log. Starts with one blank X row, paths start blank; press Add Drive
+  for more, up to 6 drives. The list is saved to `UtilityCloset.ini`
+  next to the exe and restored on launch.
 - **System File Checker** — launches `sfc /scannow` in its own window.
+- **DISM — Windows Image Repair** — three buttons, each in its own window:
+  Check Health (quick check for a flagged-corrupt image), Scan Health
+  (deeper scan for component store damage), and Restore Health (repairs
+  the image, downloading replacement files via Windows Update — takes
+  10-20+ minutes and needs an internet connection for the download part).
+  This is the same repair as the PowerShell `Repair-WindowsImage -Online
+  -RestoreHealth` alternative.
 - **Display Cache** — deletes the GPU display-configuration registry keys
   (`GraphicsDrivers\{Configuration, Connectivity, ScaleFactors}`). Restart
   required afterwards.
@@ -57,6 +64,13 @@ below.)
   Caveat: on Windows 11 some apps' per-app overflow settings can still
   override this, so it is the closest thing to a global switch, not a
   guaranteed override for every app.
+- **Windows Annoyances Reset to defaults** — a button at the bottom of
+  the Windows Annoyances section that restores Windows' own defaults:
+  forced shutdown OFF, welcome experience ON (the post-update setup
+  screen is allowed again — that is the Windows default, even though
+  you will usually have it off), and show all tray icons OFF. If the
+  tray-icons state changed, Explorer restarts once so the taskbar
+  picks it up.
 - Shortcuts are named "Utility Closet" (not "The Utility Closet") on the
   desktop and in the Start Menu; installing v1.0.7 also removes the old
   "The Utility Closet" shortcuts.

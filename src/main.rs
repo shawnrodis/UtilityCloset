@@ -475,13 +475,12 @@ impl ClosetApp {
         app.forced_shutdown = is_forced_shutdown();
         app.welcome_experience = is_welcome_experience_on();
         app.show_all_tray_icons = is_show_all_tray_icons();
+        // Fresh start: one blank X row only. If the user wants more
+        // drives, the "Add Drive" button adds them — no prefilled Y row.
+        // Saved drives from load_config() above are left untouched.
         if app.drives.is_empty() {
             app.drives.push(DriveRow {
                 letter: "X".into(),
-                path: String::new(),
-            });
-            app.drives.push(DriveRow {
-                letter: "Y".into(),
                 path: String::new(),
             });
         }
@@ -615,6 +614,18 @@ impl ClosetApp {
         self.log_line("Launching sfc /scannow in a new window...");
         let _ = Command::new("cmd")
             .args(["/c", "start", "cmd", "/k", "sfc", "/scannow"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+
+    /// DISM, like SFC, runs in its own window so the user can watch
+    /// progress — it is deliberately NOT run hidden via run_logged.
+    fn run_dism(&mut self, args: &[&str], label: &str) {
+        self.log_line(&format!("Launching DISM {label} in a new window..."));
+        let mut cmd_args: Vec<&str> = vec!["/c", "start", "cmd", "/k", "DISM.exe"];
+        cmd_args.extend_from_slice(args);
+        let _ = Command::new("cmd")
+            .args(&cmd_args)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
@@ -998,6 +1009,45 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("DISM — Windows Image Repair").strong());
+                    ui.horizontal(|ui| {
+                        if ui.button("Check Health").clicked() {
+                            self.run_dism(
+                                &["/Online", "/Cleanup-Image", "/CheckHealth"],
+                                "/Online /Cleanup-Image /CheckHealth",
+                            );
+                        }
+                        if ui.button("Scan Health").clicked() {
+                            self.run_dism(
+                                &["/Online", "/Cleanup-Image", "/ScanHealth"],
+                                "/Online /Cleanup-Image /ScanHealth",
+                            );
+                        }
+                        if ui.button("Restore Health").clicked() {
+                            self.run_dism(
+                                &["/Online", "/Cleanup-Image", "/RestoreHealth"],
+                                "/Online /Cleanup-Image /RestoreHealth",
+                            );
+                        }
+                    });
+                    ui.label(
+                        "Check Health is a quick check for whether the image has \
+                         been flagged as corrupted; Scan Health is a deeper scan \
+                         for component store damage. Restore Health repairs the \
+                         image, downloading replacement files via Windows Update — \
+                         it takes a while (10-20+ minutes) and needs an internet \
+                         connection for the download part. Each runs in its own \
+                         window so you can watch progress.",
+                    );
+                    ui.label(
+                        "This is the same repair as the PowerShell alternative \
+                         (Repair-WindowsImage -Online -RestoreHealth) — no \
+                         separate PowerShell button is needed.",
+                    );
+                });
+
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new("Display Cache").strong());
                     ui.horizontal(|ui| {
                         if ui.button("Clear & Reset Display Cache").clicked() {
@@ -1169,6 +1219,79 @@ impl eframe::App for ClosetApp {
                          can still override this, so it is the closest thing to a \
                          global switch, not a guaranteed override for every app.",
                     );
+                    ui.add_space(6.0);
+                    // Reset to WINDOWS defaults — not the user's preferred
+                    // settings. Each toggle follows the same revert-on-failure
+                    // pattern as its checkbox; Explorer restarts at most
+                    // once, at the end, and only if the tray-icons state
+                    // actually changed.
+                    if ui.button("Reset to defaults").clicked() {
+                        let tray_before = self.show_all_tray_icons;
+                        self.log_line(
+                            "Resetting Windows Annoyances to Windows defaults \
+                             (not your preferred settings): forced shutdown OFF, \
+                             welcome experience ON, show all tray icons OFF.",
+                        );
+                        if apply_forced_shutdown(false) {
+                            self.forced_shutdown = false;
+                            self.log_line(
+                                "Forced shutdown reset to OFF (Windows default).",
+                            );
+                        } else {
+                            self.log_line(
+                                "Failed to reset forced shutdown — that toggle \
+                                 was left unchanged.",
+                            );
+                        }
+                        if apply_welcome_experience(true) {
+                            self.welcome_experience = true;
+                            self.log_line(
+                                "Welcome experience reset to ON (Windows default: \
+                                 the post-update setup screen is allowed again).",
+                            );
+                        } else {
+                            self.log_line(
+                                "Failed to reset the welcome experience — that \
+                                 toggle was left unchanged.",
+                            );
+                        }
+                        if apply_show_all_tray_icons(false) {
+                            self.show_all_tray_icons = false;
+                            self.log_line(
+                                "Show all tray icons reset to OFF (Windows \
+                                 default: inactive icons hide again).",
+                            );
+                        } else {
+                            self.log_line(
+                                "Failed to reset the tray-icons setting — that \
+                                 toggle was left unchanged.",
+                            );
+                        }
+                        if tray_before != self.show_all_tray_icons {
+                            self.log_line(
+                                "Restarting Explorer so the taskbar picks up the \
+                                 tray-icons reset (the taskbar will briefly \
+                                 disappear and come back).",
+                            );
+                            let _ = Command::new("taskkill")
+                                .args(["/IM", "explorer.exe", "/F"])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            let _ = Command::new("explorer.exe")
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .spawn();
+                        }
+                    }
+                    ui.label(
+                        "\"Defaults\" here means Windows' own defaults, not your \
+                         preferred settings: forced shutdown OFF, welcome \
+                         experience ON (the post-update setup screen is allowed \
+                         again — that is the Windows default, even though you \
+                         will usually have it off), and show all tray icons OFF. \
+                         If the tray-icons state changed, Explorer restarts once \
+                         so the taskbar picks it up.",
+                    );
                 });
 
                 ui.add_space(6.0);
@@ -1280,11 +1403,13 @@ impl eframe::App for ClosetApp {
                              • Network drive mapping\n\
                              • Printer add/remove\n\
                              • System File Checker (sfc /scannow)\n\
+                             • DISM Windows image repair (Check / Scan / Restore Health)\n\
                              • Display cache reset\n\
                              • Icon cache rebuild\n\
                              • Forced shutdown toggle\n\
                              • Windows welcome experience toggle\n\
-                             • Always show all tray icons toggle\n\n\
+                             • Always show all tray icons toggle\n\
+                             • Windows Annoyances Reset to defaults\n\n\
                              Built for Shawn Rodis."
                         ),
                     );
