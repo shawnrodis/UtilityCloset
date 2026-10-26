@@ -15,8 +15,8 @@ rights on launch (every tool needs them).
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="The Utility Closet main window: Network Drives, System File Checker, Display Cache, Icon Cache, and the log" width="520">
-  <br><em>Everything in one small window — drives, SFC, both cache tools, and a live log.</em>
+  <img src="assets/screenshot-v1.0.8.png" alt="The Utility Closet main window (v1.0.8): Network Drives, Printers, System File Checker, DISM, Display Cache, Icon Cache, Windows Annoyances, and the log" width="520">
+  <br><em>Everything in one small window (v1.0.8) — drives, printers, SFC, DISM, both cache tools, Windows Annoyances, and a live log.</em>
 </p>
 
 ## Download
