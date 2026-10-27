@@ -20,7 +20,7 @@ installer is admin, and the Windows runner manifest is patched to
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screenshot-v1.0.8.png" alt="The Utility Closet main window" width="520">
+  <img src="assets/screenshot-v1.1.2.png" alt="The Utility Closet main window" width="520">
 </p>
 
 ## Download
