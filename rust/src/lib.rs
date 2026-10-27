@@ -708,15 +708,19 @@ fn load_existing_vec(drives_in: &[DriveRow]) -> (Vec<DriveRow>, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
     let mut drives: Vec<DriveRow> = drives_in.to_vec();
     let mut loaded_drives = 0usize;
+    let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
     match run_ps("Get-SmbMapping | Select-Object LocalPath,RemotePath | ConvertTo-Json -Compress") {
         Ok(text) => {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if text.trim().is_empty() {
+                log.push("No live session mappings found (an elevated session sees only its own mappings).".to_string());
+            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 for item in json_array(v) {
                     let letter = json_str(&item, "LocalPath").trim_end_matches(':').to_string();
                     let path = json_str(&item, "RemotePath");
                     if letter.is_empty() || path.is_empty() {
                         continue;
                     }
+                    confirmed.insert(normalized_letter(&letter).unwrap_or_else(|| letter.clone()));
                     if let Some(row) = drives.iter_mut().find(|r| {
                         !r.is_location()
                             && normalized_letter(&r.label).as_deref() == Some(letter.as_str())
@@ -755,13 +759,17 @@ fn load_existing_vec(drives_in: &[DriveRow]) -> (Vec<DriveRow>, Vec<String>) {
                 if path.is_empty() {
                     continue;
                 }
-                if drives.iter().any(|r| {
+                if confirmed.contains(&letter) {
+                    continue;
+                }
+                confirmed.insert(letter.clone());
+                if let Some(row) = drives.iter_mut().find(|r| {
                     !r.is_location()
                         && normalized_letter(&r.label).as_deref() == Some(letter.as_str())
                 }) {
-                    continue;
-                }
-                if drives.len() < MAX_DRIVES {
+                    row.path = path;
+                    loaded_drives += 1;
+                } else if drives.len() < MAX_DRIVES {
                     drives.push(DriveRow::drive(letter, path));
                     loaded_drives += 1;
                 }
