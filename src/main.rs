@@ -3176,6 +3176,13 @@ fn main() {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Wgpu (DirectX on Windows) instead of the default Glow
+        // (OpenGL) renderer: Glow flashed black and stuttered
+        // while dragging/resizing on Windows + NVIDIA, in every
+        // version of this app including the original. Wgpu is
+        // the native DirectX path on Windows and does not have
+        // that resize/drag black-frame behaviour.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     let _ = eframe::run_native(
