@@ -36,6 +36,7 @@ Section "${APP_NAME}" SecApp
   SectionIn RO
   SetOutPath "$INSTDIR"
   File /r "staging\*.*"
+  Delete "$INSTDIR\UtilityCloset.exe"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayName" "${APP_NAME}"
@@ -67,6 +68,7 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\utility_closet_flutter.exe"
+  Delete "$INSTDIR\UtilityCloset.exe"
   Delete "$INSTDIR\utility_closet_core.dll"
   Delete "$INSTDIR\flutter_windows.dll"
   Delete "$INSTDIR\Uninstall.exe"
