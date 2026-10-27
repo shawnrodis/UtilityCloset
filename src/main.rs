@@ -2704,19 +2704,12 @@ $results -join "`n"
                  not re-pin it — re-pin from Start if you want it back.",
             );
             ui.add_space(6.0);
-            // Standalone uninstall, independent of the checkbox:
-            // if the checkbox is already OFF, there is no OFF
-            // transition left to trigger an uninstall, so a
-            // still-installed Copilot could never be retried.
-            // This button runs the same uninstall on demand.
-            if ui.button("Uninstall Copilot app now").clicked() {
-                self.log_line("Uninstalling the Copilot app on demand (all install forms; its own uninstall dialog may appear — answer Yes).");
-                let msg = uninstall_copilot_app();
-                self.log_line(&msg);
-                if unpin_copilot_from_taskbar() {
-                    self.log_line("Copilot taskbar pin removed.");
-                }
-            }
+            // No standalone uninstall button, by design: toggling
+            // the checkbox OFF uninstalls the app, and toggling it
+            // back ON reinstalls it. That is the only path, so the
+            // toggle must (and does) do the full install/uninstall
+            // itself — a separate button would just be a second,
+            // confusing way to do the same thing.
             ui.add_space(6.0);
             // Reset to WINDOWS defaults — not the user's preferred
             // settings. Each toggle follows the same revert-on-failure
