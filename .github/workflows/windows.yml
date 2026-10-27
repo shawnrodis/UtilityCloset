@@ -31,6 +31,13 @@ jobs:
           if (Test-Path assets/UtilityCloset.ico) {
             Copy-Item -Force assets/UtilityCloset.ico app/windows/runner/resources/app_icon.ico
           }
+          # Window title: flutter create names the native window after the
+          # project (utility_closet_flutter) — replace it with the app name,
+          # otherwise the title bar / taskbar shows the project slug.
+          $mainCpp = 'app/windows/runner/main.cpp'
+          if (Test-Path $mainCpp) {
+            (Get-Content $mainCpp -Raw) -replace 'utility_closet_flutter', 'Utility Closet' | Set-Content $mainCpp
+          }
       - name: Build Windows release
         run: |
           cd app
@@ -56,4 +63,4 @@ jobs:
           name: utility-closet-windows
           path: |
             UtilityCloset-Windows.zip
-            installer/UtilityCloset-Setup-v1.1.0.exe
+            installer/UtilityCloset-Setup-v1.1.1.exe
