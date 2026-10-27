@@ -949,7 +949,7 @@ class _ClosetHomeState extends State<ClosetHome> {
         'Instantly close frozen apps (no waiting)',
         _instantClose,
         'With this on, Windows treats an app as frozen and ends it after about 1 second, instead of waiting several seconds (and, at shutdown, up to 20 seconds) before acting. Applies immediately — no reboot needed.',
-        'Warning: with this on, an app that is merely slow (not truly frozen) can be ended sooner, and unsaved work in it can be lost. This shares Windows' hung-app settings with Force shutdown above, so turning it on also turns Force shutdown on, and turning Force shutdown off turns this off.',
+        "Warning: with this on, an app that is merely slow (not truly frozen) can be ended sooner, and unsaved work in it can be lost. This shares Windows' hung-app settings with Force shutdown above, so turning it on also turns Force shutdown on, and turning Force shutdown off turns this off.",
         _toggleInstant,
       ),
       _toggleRow(
