@@ -2816,6 +2816,14 @@ $results -join "`n"
     fn section_log(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Log").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            // The log text itself is read-only (not selectable),
+            // so this is the only way to get it out of the app —
+            // e.g. to paste it into a bug report.
+            if ui.button("Copy Log").clicked() {
+                let text = self.log.clone();
+                ui.ctx().copy_text(text);
+                self.log_line("Log copied to clipboard.");
+            }
             egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut self.log)
