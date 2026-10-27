@@ -122,6 +122,7 @@ struct ClosetApp {
     printers: Vec<String>,
     selected_printer: Option<usize>,
     forced_shutdown: bool,
+    instant_close_frozen: bool,
     welcome_experience: bool,
     show_all_tray_icons: bool,
     copilot_enabled: bool,
@@ -395,6 +396,77 @@ fn apply_forced_shutdown(on: bool) -> bool {
     ok
 }
 
+/// Instantly close frozen apps: the same hung-app settings as
+/// forced shutdown, but at the fastest practical values, so a
+/// not-responding app is ended after about 1 second instead of
+/// Windows waiting ~5 seconds (apps) / ~20 seconds (shutdown
+/// kill) first. ON: AutoEndTasks=1, WaitToKillAppTimeout=1000,
+/// HungAppTimeout=1000, WaitToKillServiceTimeout=1000.
+/// OFF: the Windows defaults (0, 20000, 5000, 5000).
+/// Read switch is HungAppTimeout <= 1000. Note the overlap with
+/// forced shutdown (which uses 2000): the two toggles share
+/// these keys, so the app re-reads the other toggle after
+/// either one changes, and they can never claim different
+/// states for the same registry values.
+fn is_instant_close_frozen() -> bool {
+    let out = Command::new("reg")
+        .args(["query", DESKTOP_KEY, "/v", "HungAppTimeout"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find(|l| l.contains("HungAppTimeout"))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.trim_start_matches("0x").parse::<u32>().ok().or_else(|| v.parse::<u32>().ok()))
+            .map(|ms| ms > 0 && ms <= 1000)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+fn apply_instant_close_frozen(on: bool) -> bool {
+    let (auto_end, kill_app, hung, kill_svc) = if on {
+        ("1", "1000", "1000", "1000")
+    } else {
+        ("0", "20000", "5000", "5000")
+    };
+    let mut ok = true;
+    for (name, value) in [
+        ("AutoEndTasks", auto_end),
+        ("WaitToKillAppTimeout", kill_app),
+        ("HungAppTimeout", hung),
+    ] {
+        let status = Command::new("reg")
+            .args([
+                "add", DESKTOP_KEY, "/v", name, "/t", "REG_SZ", "/d", value, "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            ok = false;
+        }
+    }
+    let status = Command::new("reg")
+        .args([
+            "add",
+            r"HKLM\SYSTEM\CurrentControlSet\Control",
+            "/v",
+            "WaitToKillServiceTimeout",
+            "/t",
+            "REG_SZ",
+            "/d",
+            kill_svc,
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        ok = false;
+    }
+    ok
+}
+
 /// Windows welcome experience (the post-update "Let's finish setting
 /// up your device" / "Get even more out of Windows" screen with OneDrive
 /// backup, Microsoft 365, etc. prompts).
@@ -584,9 +656,14 @@ fn is_copilot_app_installed() -> bool {
 /// "Copilot"? (Microsoft 365 Copilot is a different entry and is
 /// deliberately not counted here.)
 fn copilot_still_present() -> bool {
+    // All three Programs and Features locations, not just the
+    // 64-bit HKLM one: v1.0.12 only checked HKLM main, so a
+    // per-user (HKCU) or 32-bit (WOW6432Node) install made the
+    // check say "gone" while the entry was still sitting there.
     match run_ps(
-        "$appx = Get-AppxPackage -Name 'Microsoft.Copilot*' -ErrorAction SilentlyContinue; \
-         $reg = Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall' -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Copilot' }; \
+        "$keys = @('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', 'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall', 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'); \
+         $reg = $false; foreach ($k in $keys) { if (Get-ChildItem $k -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Copilot' }) { $reg = $true } }; \
+         $appx = Get-AppxPackage -Name 'Microsoft.Copilot*' -ErrorAction SilentlyContinue; \
          if ($appx -or $reg) { 'yes' } else { 'no' }",
     ) {
         Ok(t) => t.trim() == "yes",
@@ -604,9 +681,15 @@ fn copilot_still_present() -> bool {
 /// while a desktop install (e.g. v156.x, 2 GB, in Programs and
 /// Features) was still sitting there.
 fn uninstall_copilot_app() -> String {
-    if !copilot_still_present() {
-        return "Copilot app was not installed.".into();
-    }
+    // Close a running Copilot first: an uninstaller can fail
+    // (or refuse) while its app is open. Best-effort, ignored.
+    let _ = Command::new("taskkill")
+        .args(["/IM", "Copilot.exe", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    // No early "not installed" exit: v1.0.12 returned that when
+    // its presence check missed the install form, skipping every
+    // attempt. Try everything, then check presence at the end.
     for id in [
         "Microsoft.Copilot_8wekyb3d8bbwe",
         "Microsoft.Copilot",
@@ -627,33 +710,44 @@ fn uninstall_copilot_app() -> String {
             }
         }
     }
-    if let Ok(s) = Command::new("winget")
-        .args([
-            "uninstall",
-            "--name",
-            "Copilot",
-            "--silent",
-            "--accept-source-agreements",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-    {
-        if s.success() && !copilot_still_present() {
-            return "Copilot app uninstalled via winget (by name).".into();
+    for exact in [false, true] {
+        let mut args: Vec<&str> = vec!["uninstall", "--name", "Copilot", "--silent", "--accept-source-agreements"];
+        if exact {
+            args.push("--exact");
+        }
+        if let Ok(s) = Command::new("winget")
+            .args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+        {
+            if s.success() && !copilot_still_present() {
+                return "Copilot app uninstalled via winget (by name).".into();
+            }
         }
     }
-    // Programs and Features UninstallString, exact DisplayName only.
+    // Programs and Features UninstallString, exact DisplayName
+    // only. This is NOT silent: Copilot's own uninstaller shows
+    // an "Are you sure you want to uninstall Copilot?" dialog,
+    // exactly as Programs and Features does — the user clicks
+    // Yes, and -Wait holds until that dialog finishes. The old
+    // code wrapped the whole string in cmd /c quotes, which
+    // broke paths-with-arguments; now the executable and its
+    // arguments are split properly (quoted path first, then
+    // the rest as arguments).
     let ps = r#"
 $keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
 foreach ($k in $keys) {
     $e = Get-ChildItem $k -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Copilot' } | Select-Object -First 1
     if ($e -and $e.UninstallString) {
-        $u = $e.UninstallString
+        $u = $e.UninstallString.Trim()
         if ($u -match 'msiexec') {
             $guid = [regex]::Match($u, '\{[0-9A-Fa-f\-]+\}').Value
             if ($guid) { Start-Process 'msiexec.exe' -ArgumentList "/X$guid /quiet /norestart" -Wait }
+        } elseif ($u -match '^\s*"([^"]+)"\s*(.*)$') {
+            Start-Process $Matches[1] -ArgumentList $Matches[2] -Wait -ErrorAction Continue
         } else {
-            Start-Process 'cmd.exe' -ArgumentList "/c `"$u`"" -Wait
+            $parts = $u -split '\s+', 2
+            if ($parts.Count -gt 1) { Start-Process $parts[0] -ArgumentList $parts[1] -Wait -ErrorAction Continue } else { Start-Process $parts[0] -Wait -ErrorAction Continue }
         }
         break
     }
@@ -678,7 +772,7 @@ foreach ($k in $keys) {
         .status()
     {
         Ok(_) if !copilot_still_present() => "Copilot app uninstalled (AppxPackage).".into(),
-        _ => "Copilot app uninstall did not confirm — it may still be installed; check Settings > Apps or Programs and Features.".into(),
+        _ => "Copilot app uninstall did not confirm — it is still present. If its uninstall dialog appeared, answer Yes; otherwise uninstall it in Programs and Features (select Copilot > Uninstall), which shows the same dialog.".into(),
     }
 }
 
@@ -983,6 +1077,7 @@ impl ClosetApp {
             printers: Vec::new(),
             selected_printer: None,
             forced_shutdown: false,
+            instant_close_frozen: false,
             welcome_experience: true,
             show_all_tray_icons: false,
             copilot_enabled: true,
@@ -1003,9 +1098,18 @@ impl ClosetApp {
         app.update_pending = true;
         thread::spawn(move || check_updates(utx));
         app.load_config();
+        // Auto-detect on launch: the list must show drives and
+        // network locations this PC already has, whether or not
+        // the app configured them — not just what was typed in
+        // or pulled in with Load Existing. Load Existing remains
+        // as a manual re-scan. Consequence, by design: removing
+        // a live drive/location row only hides it until the next
+        // launch; use Disconnect to actually remove it.
+        app.load_existing_drives();
         // Forced-shutdown toggle reflects the real registry state, not
         // a saved setting (another tool could have changed it).
         app.forced_shutdown = is_forced_shutdown();
+        app.instant_close_frozen = is_instant_close_frozen();
         app.welcome_experience = is_welcome_experience_on();
         app.show_all_tray_icons = is_show_all_tray_icons();
         app.copilot_enabled = is_copilot_enabled();
@@ -1928,7 +2032,7 @@ $results -join "`n"
         let drives_configured = self.drives.iter().filter(|r| !r.path.trim().is_empty()).count();
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Network Drives & Locations").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-            ui.label(format!("{drives_configured} drive(s) configured in the app."));
+            ui.label(format!("{drives_configured} drive(s)/location(s) in the app list, including ones this PC already had."));
             if ui.button("Open Network Drives & Locations").clicked() {
                 self.nav = Nav::Drives;
             }
@@ -1963,8 +2067,9 @@ $results -join "`n"
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Windows Annoyances").strong().color(egui::Color32::from_rgb(0, 128, 140)));
             ui.label(format!(
-                "Forced shutdown {} \u{00b7} Welcome experience {} \u{00b7} Tray icons {} \u{00b7} Copilot {}",
+                "Forced shutdown {} \u{00b7} Instant close {} \u{00b7} Welcome experience {} \u{00b7} Tray icons {} \u{00b7} Copilot {}",
                 if self.forced_shutdown { "on" } else { "off" },
+                if self.instant_close_frozen { "on" } else { "off" },
                 if self.welcome_experience { "on" } else { "off" },
                 if self.show_all_tray_icons { "all shown" } else { "normal" },
                 if self.copilot_enabled { "on" } else { "off" },
@@ -2044,11 +2149,12 @@ $results -join "`n"
             ui.label(
                 "Drive = a letter-mapped drive (net use, e.g. X:). Location = a \
                  network location shortcut in This PC > Network locations, with \
-                 no drive letter — just a name and a UNC path. Load Existing pulls \
-                 in both: drives this PC already has mapped and locations it \
-                 already has, so the list is never blank when the PC already \
-                 has network things. Map Drives adds both kinds; Disconnect \
-                 removes both kinds.",
+                 no drive letter — just a name and a UNC path. This list always \
+                 includes drives and locations this PC already has, whether or \
+                 not the app configured them — it is scanned on launch, and \
+                 Load Existing re-scans it. Removing a row only hides it until \
+                 the next launch; Disconnect actually removes it. Map Drives \
+                 adds both kinds; Disconnect removes both kinds.",
             );
         });
 
@@ -2287,6 +2393,11 @@ $results -join "`n"
             {
                 let on = self.forced_shutdown;
                 if apply_forced_shutdown(on) {
+                    // Shared hung-app keys: re-read the instant-close
+                    // toggle so it never claims a state the registry
+                    // no longer has (forced OFF resets HungAppTimeout
+                    // to 5000, so instant close is off after that).
+                    self.instant_close_frozen = is_instant_close_frozen();
                     if on {
                         self.log_line(
                             "Forced shutdown ON: Windows will end open apps itself \
@@ -2317,6 +2428,57 @@ $results -join "`n"
             ui.label(
                 "Warning: with this on, unsaved work in open apps can be \
                  lost, because Windows will no longer stop and ask.",
+            );
+            ui.add_space(6.0);
+            // Instant close for frozen apps, same pattern as above.
+            if ui
+                .checkbox(
+                    &mut self.instant_close_frozen,
+                    "Instantly close frozen apps (no waiting)",
+                )
+                .changed()
+            {
+                let on = self.instant_close_frozen;
+                if apply_instant_close_frozen(on) {
+                    // Shared keys: turning this on also sets
+                    // AutoEndTasks=1, so Force shutdown reads on
+                    // too; turning it off restores the defaults,
+                    // so Force shutdown reads off too.
+                    self.forced_shutdown = is_forced_shutdown();
+                    if on {
+                        self.log_line(
+                            "Instant close ON: a not-responding app is ended \
+                             after about 1 second (HungAppTimeout, \
+                             WaitToKillAppTimeout and service timeout all \
+                             1000 ms) instead of Windows waiting ~5–20 seconds.",
+                        );
+                    } else {
+                        self.log_line(
+                            "Instant close OFF: frozen-app and shutdown \
+                             timeouts restored to Windows defaults.",
+                        );
+                    }
+                } else {
+                    self.instant_close_frozen = !on;
+                    self.log_line(
+                        "Failed to change the instant-close setting — \
+                         the toggle was left unchanged.",
+                    );
+                }
+            }
+            ui.label(
+                "With this on, Windows treats an app as frozen and ends \
+                 it after about 1 second, instead of waiting several \
+                 seconds (and, at shutdown, up to 20 seconds) before \
+                 acting. Applies immediately — no reboot needed.",
+            );
+            ui.label(
+                "Warning: with this on, an app that is merely slow (not \
+                 truly frozen) can be ended sooner, and unsaved work \
+                 in it can be lost. This shares Windows' hung-app \
+                 settings with Force shutdown above, so turning it on \
+                 also turns Force shutdown on, and turning Force \
+                 shutdown off turns this off.",
             );
             ui.add_space(6.0);
             // Same immediate-apply, revert-on-failure pattern as
@@ -2497,6 +2659,20 @@ $results -join "`n"
                  not re-pin it — re-pin from Start if you want it back.",
             );
             ui.add_space(6.0);
+            // Standalone uninstall, independent of the checkbox:
+            // if the checkbox is already OFF, there is no OFF
+            // transition left to trigger an uninstall, so a
+            // still-installed Copilot could never be retried.
+            // This button runs the same uninstall on demand.
+            if ui.button("Uninstall Copilot app now").clicked() {
+                self.log_line("Uninstalling the Copilot app on demand (all install forms; its own uninstall dialog may appear — answer Yes).");
+                let msg = uninstall_copilot_app();
+                self.log_line(&msg);
+                if unpin_copilot_from_taskbar() {
+                    self.log_line("Copilot taskbar pin removed.");
+                }
+            }
+            ui.add_space(6.0);
             // Reset to WINDOWS defaults — not the user's preferred
             // settings. Each toggle follows the same revert-on-failure
             // pattern as its checkbox; Explorer restarts at most
@@ -2507,10 +2683,12 @@ $results -join "`n"
                 self.log_line(
                     "Resetting Windows Annoyances to Windows defaults \
                      (not your preferred settings): forced shutdown OFF, \
-                     welcome experience ON, show all tray icons OFF.",
+                     instant close OFF, welcome experience ON, show all \
+                     tray icons OFF.",
                 );
                 if apply_forced_shutdown(false) {
                     self.forced_shutdown = false;
+                    self.instant_close_frozen = false;
                     self.log_line(
                         "Forced shutdown reset to OFF (Windows default).",
                     );
@@ -2562,10 +2740,11 @@ $results -join "`n"
             }
             ui.label(
                 "\"Defaults\" here means Windows' own defaults, not your \
-                 preferred settings: forced shutdown OFF, welcome \
-                 experience ON (the post-update setup screen is allowed \
-                 again — that is the Windows default, even though you \
-                 will usually have it off), and show all tray icons OFF. \
+                 preferred settings: forced shutdown OFF, instant close \
+                 OFF, welcome experience ON (the post-update setup screen \
+                 is allowed again — that is the Windows default, even \
+                 though you will usually have it off), and show all tray \
+                 icons OFF. \
                  If the tray-icons state changed, Explorer restarts once \
                  so the taskbar picks it up.",
             );
