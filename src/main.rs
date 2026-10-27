@@ -2680,11 +2680,12 @@ $results -join "`n"
             // actually changed.
             if ui.button("Reset to defaults").clicked() {
                 let tray_before = self.show_all_tray_icons;
+                let copilot_before = self.copilot_enabled;
                 self.log_line(
                     "Resetting Windows Annoyances to Windows defaults \
                      (not your preferred settings): forced shutdown OFF, \
                      instant close OFF, welcome experience ON, show all \
-                     tray icons OFF.",
+                     tray icons OFF, Microsoft Copilot ON.",
                 );
                 if apply_forced_shutdown(false) {
                     self.forced_shutdown = false;
@@ -2722,11 +2723,32 @@ $results -join "`n"
                          toggle was left unchanged.",
                     );
                 }
-                if tray_before != self.show_all_tray_icons {
+                // Copilot was the one toggle Reset skipped: Windows'
+                // default is Copilot ON, so Reset now clears the
+                // policy, shows the taskbar button again, and
+                // reinstalls the app (winget, can take a few
+                // minutes) — same as flipping the toggle on.
+                if apply_copilot_enabled(true) {
+                    self.copilot_enabled = true;
+                    self.log_line(
+                        "Microsoft Copilot reset to ON (Windows default: \
+                         policy cleared, taskbar button back).",
+                    );
+                    let msg = install_copilot_app();
+                    self.log_line(&msg);
+                } else {
+                    self.log_line(
+                        "Failed to reset Microsoft Copilot — that toggle \
+                         was left unchanged.",
+                    );
+                }
+                if tray_before != self.show_all_tray_icons
+                    || copilot_before != self.copilot_enabled
+                {
                     self.log_line(
                         "Restarting Explorer so the taskbar picks up the \
-                         tray-icons reset (the taskbar will briefly \
-                         disappear and come back).",
+                         reset (the taskbar will briefly disappear and \
+                         come back).",
                     );
                     let _ = Command::new("taskkill")
                         .args(["/IM", "explorer.exe", "/F"])
@@ -2743,10 +2765,11 @@ $results -join "`n"
                  preferred settings: forced shutdown OFF, instant close \
                  OFF, welcome experience ON (the post-update setup screen \
                  is allowed again — that is the Windows default, even \
-                 though you will usually have it off), and show all tray \
-                 icons OFF. \
-                 If the tray-icons state changed, Explorer restarts once \
-                 so the taskbar picks it up.",
+                 though you will usually have it off), show all tray \
+                 icons OFF, and Microsoft Copilot ON (reinstalled if it \
+                 was removed). This covers every toggle on this page. \
+                 If the tray-icons or Copilot state changed, Explorer \
+                 restarts once so the taskbar picks it up.",
             );
         });
 
