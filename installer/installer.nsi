@@ -9,7 +9,7 @@
 ; elevation from its embedded manifest, not from a runtime re-launch.
 
 !define APP_NAME "Utility Closet"
-!define APP_VERSION "1.1.3"
+!define APP_VERSION "1.1.4"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/UtilityCloset"
 

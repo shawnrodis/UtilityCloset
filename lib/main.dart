@@ -28,7 +28,7 @@ import 'package:http/http.dart' as http;
 
 import 'rust_bridge.dart';
 
-const String appVersion = '1.1.3';
+const String appVersion = '1.1.4';
 const Color teal = Color(0xFF00808C);
 
 void main() {

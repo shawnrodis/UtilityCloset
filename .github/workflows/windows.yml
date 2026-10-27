@@ -96,4 +96,4 @@ jobs:
           name: utility-closet-windows
           path: |
             UtilityCloset-Windows.zip
-            installer/UtilityCloset-Setup-v1.1.3.exe
+            installer/UtilityCloset-Setup-v1.1.4.exe
