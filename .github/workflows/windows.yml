@@ -30,13 +30,23 @@ jobs:
           # policy bug) — so patch AND verify, failing loudly.
           $manifest = Get-ChildItem app/windows/runner -Filter *.manifest | Select-Object -First 1
           if (-not $manifest) { throw "no runner manifest found under app/windows/runner" }
-          Write-Host "MANIFEST-FOUND: $($manifest.FullName)"
+          # The Flutter template manifest has NO execution-level
+          # line at all (no trustInfo section) — so the old
+          # asInvoker replace was a no-op by construction, and the
+          # linker stamped the exe asInvoker by default. Insert an
+          # explicit requireAdministrator section instead.
           $raw = Get-Content $manifest.FullName -Raw
-          Write-Host "MANIFEST-LENGTH: $($raw.Length)"
-          Write-Host "MANIFEST-CONTENT-BEGIN"
-          Write-Host $raw
-          Write-Host "MANIFEST-CONTENT-END"
-          throw "diagnostic dump only" 
+          if ($raw -match 'requestedExecutionLevel') {
+            $raw = $raw -replace 'level="[^"]*"', 'level="requireAdministrator"'
+          } else {
+            $trustInfo = '  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges><requestedExecutionLevel level="requireAdministrator" uiAccess="false" /></requestedPrivileges></security></trustInfo>'
+            $marker = '<application xmlns="urn:schemas-microsoft-com:asm.v3">'
+            $idx = $raw.IndexOf($marker)
+            if ($idx -lt 0) { throw "manifest application element not found" }
+            $raw = $raw.Substring(0, $idx) + $trustInfo + "`n" + $raw.Substring($idx)
+          }
+          Set-Content $manifest.FullName -Value $raw -NoNewline
+          if (-not (Select-String -Path $manifest.FullName -Pattern 'level="requireAdministrator"' -Quiet)) { throw "runner manifest patch failed: requireAdministrator not present" }
           if (Test-Path assets/UtilityCloset.ico) {
             Copy-Item -Force assets/UtilityCloset.ico app/windows/runner/resources/app_icon.ico
           }
