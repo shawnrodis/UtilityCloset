@@ -101,6 +101,7 @@ enum Confirm {
     DisplayCache,
     IconCache,
     Reboot,
+    DeleteBackups,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1668,6 +1669,36 @@ impl ClosetApp {
         }
     }
 
+    /// Delete the app's backup files (main backup, standalone
+    /// monitor layout, and Display-*.reg fallbacks). Only those
+    /// known files are removed — the backup folder itself and
+    /// anything else in it are left alone. This does not change
+    /// any live drive, printer, or monitor setting; Export can
+    /// recreate the backups afterward.
+    fn delete_backups(&mut self) {
+        let dir = backup_dir();
+        let mut deleted = 0;
+        for name in [
+            "UtilityCloset-Backup.json",
+            "Monitor-Layout.json",
+            "Display-Configuration.reg",
+            "Display-Connectivity.reg",
+            "Display-ScaleFactors.reg",
+        ] {
+            if std::fs::remove_file(dir.join(name)).is_ok() {
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            self.log_line(&format!(
+                "Deleted {deleted} backup file(s) from {}.",
+                dir.display()
+            ));
+        } else {
+            self.log_line("No backup files found to delete.");
+        }
+    }
+
     fn export_backup(&mut self) {
         let dir = backup_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -2287,6 +2318,9 @@ $results -join "`n"
                         .arg(dir)
                         .creation_flags(CREATE_NO_WINDOW)
                         .spawn();
+                }
+                if ui.button("Delete Backups").clicked() {
+                    self.confirm = Some(Confirm::DeleteBackups);
                 }
             });
             ui.label(format!(
@@ -3021,6 +3055,16 @@ impl eframe::App for ClosetApp {
                     "Restart PC",
                     "Icon cache cleared. Restart now to finish rebuilding?",
                 ),
+                Confirm::DeleteBackups => (
+                    "Delete Backups",
+                    "This deletes the saved backups in Documents\\Utility Closet:\n\
+                     UtilityCloset-Backup.json, Monitor-Layout.json, and the \
+                     Display-*.reg files.\n\n\
+                     It does NOT change any live drive, printer, or monitor \
+                     setting — it only removes the saved files, so Import \
+                     will have nothing to restore until you Export again.\n\n\
+                     Continue?",
+                ),
             };
             let mut decision: Option<bool> = None;
             egui::Window::new(title)
@@ -3041,6 +3085,7 @@ impl eframe::App for ClosetApp {
                 });
             match decision {
                 Some(true) => match kind {
+                    Confirm::DeleteBackups => self.delete_backups(),
                     Confirm::DisplayCache => self.clear_display_cache(),
                     Confirm::IconCache => {
                         self.rebuild_icon_cache();
