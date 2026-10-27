@@ -1,9 +1,15 @@
-; Utility Closet installer (NSIS 3.x)
+; Utility Closet — Flutter installer (NSIS 3.x)
 ; Requires administrator (the app itself needs elevation for SFC/registry work).
 ; Installs to %PROGRAMFILES%\UtilityCloset.
+; Flutter build: exe + utility_closet_core.dll + flutter_windows.dll
+; + plugin DLLs + data/ folder must all be installed together.
+; Admin behaviour: installer is admin AND the Windows runner manifest
+; is patched to requireAdministrator in the workflow (see
+; .github/workflows/windows.yml) — same as the egui app, which got
+; elevation from its embedded manifest, not from a runtime re-launch.
 
 !define APP_NAME "Utility Closet"
-!define APP_VERSION "1.0.23"
+!define APP_VERSION "1.1.0"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/UtilityCloset"
 
@@ -19,7 +25,7 @@ ShowInstDetails show
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_RUN "$INSTDIR\UtilityCloset.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\utility_closet_flutter.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -27,37 +33,30 @@ ShowInstDetails show
 !insertmacro MUI_LANGUAGE "English"
 
 Section "${APP_NAME}" SecApp
-  SectionIn RO  ; required — cannot be unchecked
+  SectionIn RO
   SetOutPath "$INSTDIR"
-  File "UtilityCloset.exe"
+  File /r "staging\*.*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  ; Add/Remove Programs entry (machine-wide, needs admin).
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayName" "${APP_NAME}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayIcon" "$INSTDIR\UtilityCloset.exe"
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "EstimatedSize" 16448
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "DisplayIcon" "$INSTDIR\utility_closet_flutter.exe"
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset" "EstimatedSize" 22000
 
-  ; Start Menu shortcuts (all users).
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\UtilityCloset.exe"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\utility_closet_flutter.exe"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 
-  ; Clean up the pre-rename shortcuts (v1.0.6 and earlier used
-  ; "The Utility Closet") so upgraders don't keep stale icons.
   Delete "$SMPROGRAMS\The Utility Closet\*.lnk"
   RMDir "$SMPROGRAMS\The Utility Closet"
-  ; Also here (not only in the Desktop Icon section) so the old
-  ; desktop shortcut is cleaned up even if that component is unchecked.
   Delete "$DESKTOP\The Utility Closet.lnk"
 SectionEnd
 
 Section "Desktop Icon" SecDesktop
-  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\UtilityCloset.exe"
-  ; Clean up the pre-rename desktop shortcut.
+  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\utility_closet_flutter.exe"
   Delete "$DESKTOP\The Utility Closet.lnk"
 SectionEnd
 
@@ -67,8 +66,11 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
-  Delete "$INSTDIR\UtilityCloset.exe"
+  Delete "$INSTDIR\utility_closet_flutter.exe"
+  Delete "$INSTDIR\utility_closet_core.dll"
+  Delete "$INSTDIR\flutter_windows.dll"
   Delete "$INSTDIR\Uninstall.exe"
+  RMDir /r "$INSTDIR\data"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UtilityCloset"
@@ -76,10 +78,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
   Delete "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
-
   Delete "$DESKTOP\${APP_NAME}.lnk"
-
-  ; Pre-rename (v1.0.6 and earlier) shortcuts, in case they survive.
   Delete "$SMPROGRAMS\The Utility Closet\*.lnk"
   RMDir "$SMPROGRAMS\The Utility Closet"
   Delete "$DESKTOP\The Utility Closet.lnk"

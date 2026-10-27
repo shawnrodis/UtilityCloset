@@ -1,116 +1,90 @@
 # The Utility Closet
 
-<p align="center">
-  <img src="assets/icon.png" alt="UtilityCloset app icon" width="120">
-</p>
-
 An all-in-one Windows maintenance app: network drive mapping, System File
-Checker, display cache reset, and icon cache rebuild — in one small window,
+Checker, display cache reset, and icon cache rebuild — in one window,
 no bloat.
 
-Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
-Distributed as an installer, no dependencies, no console window. Requests administrator
-rights on launch (every tool needs them).
+Built with [Rust](https://www.rust-lang.org/) (core logic) and
+[Flutter](https://flutter.dev/) (UI), RustDesk-style: the Rust core
+handles drives, printers, repairs, annoyances, and backup/restore, and
+the Flutter UI calls it through a plain C ABI. No egui — the egui
+version is preserved on the `egui-legacy` branch.
+
+Distributed as an installer, no dependencies, no console window.
+Requests administrator rights on launch (every tool needs them) — the
+installer is admin, and the Windows runner manifest is patched to
+`requireAdministrator` in the build workflow.
 
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screenshot-v1.0.8.png" alt="The Utility Closet main window (v1.0.8): Network Drives, Printers, System File Checker, DISM, Display Cache, Icon Cache, Windows Annoyances, and the log" width="520">
-  <br><em>Everything in one small window (v1.0.8) — drives, printers, SFC, DISM, both cache tools, Windows Annoyances, and a live log.</em>
+  <img src="assets/screenshot-v1.0.8.png" alt="The Utility Closet main window" width="520">
 </p>
 
 ## Download
 
 Grab the latest `UtilityCloset-Setup-vX.Y.Z.exe` installer from
 [Releases](https://github.com/shawnrodis/UtilityCloset/releases) and run it —
-requires administrator (the app needs elevation for SFC/registry work).
-Installs to `%PROGRAMFILES%\UtilityCloset` with Start Menu and desktop
-shortcuts plus an uninstaller. (Building from source is optional; instructions
-below.)
+requires administrator. Installs to `%PROGRAMFILES%\UtilityCloset` with
+Start Menu and desktop shortcuts plus an uninstaller.
 
 ## Features
 
-- **Network Drives** — map/unmap drives with `net use`, output shown live in
-  the log. Starts with one blank X row, paths start blank; press Add Drive
-  for more, up to 6 drives. The list is saved to `UtilityCloset.ini`
-  next to the exe and restored on launch.
+- **Network Drives & Locations** — map/unmap drives with `net use`, plus
+  network-location shortcuts in This PC. Starts with one blank X row;
+  Add Drive for more, up to 12 rows. The list is saved to
+  `UtilityCloset.ini` next to the exe and restored on launch, and the
+  list is scanned on launch so drives this PC already has appear too.
+- **Printers** — queue up printer paths, Add Printers adds them all at
+  once (up to 6 rows); select an installed printer to set it as default
+  or remove it.
+- **Backup & Restore** — Export snapshots live mapped drives, installed
+  printers, and full monitor layout (position, size, primary, orientation,
+  refresh rate) plus app rows, to `Documents\Utility Closet\UtilityCloset-Backup.json`;
+  Import maps drives back, re-adds network printers, and applies the
+  monitor layout to currently-connected displays (missing skipped).
+  Display registry keys are also saved as Display-*.reg fallbacks.
+  Detect Monitors / Apply Monitor Layout work on their own via
+  Monitor-Layout.json. Delete Backups removes only the known backup files.
 - **System File Checker** — launches `sfc /scannow` in its own window.
-- **DISM — Windows Image Repair** — three buttons, each in its own window:
-  Check Health (quick check for a flagged-corrupt image), Scan Health
-  (deeper scan for component store damage), and Restore Health (repairs
-  the image, downloading replacement files via Windows Update — takes
-  10-20+ minutes and needs an internet connection for the download part).
-  This is the same repair as the PowerShell `Repair-WindowsImage -Online
-  -RestoreHealth` alternative.
-- **Display Cache** — deletes the GPU display-configuration registry keys
-  (`GraphicsDrivers\{Configuration, Connectivity, ScaleFactors}`). Restart
-  required afterwards.
+- **DISM — Windows Image Repair** — Check Health, Scan Health,
+  Restore Health, each in its own window.
+- **Display Cache** — deletes the GPU display-configuration registry keys.
+  Restart required afterwards.
 - **Icon Cache** — clears the icon cache, restarts Explorer, offers a reboot.
-- **Forced Shutdown** — a toggle that changes what Windows' own Shut down /
-  Restart buttons do: on, Windows ends blocking apps itself after about
-  2 seconds instead of showing the "apps are preventing shutdown" warning;
-  off, the warning comes back. Applies immediately, no reboot needed.
-  Warning: with it on, unsaved work in open apps can be lost.
-- **Windows Welcome Experience** — a toggle that turns off the white
-  post-update setup screen ("Let's finish setting up your device" /
-  "Get even more out of Windows") with its OneDrive backup and
-  Microsoft 365 prompts. Note: Microsoft can reintroduce new prompts in
-  major updates, so this suppresses the current screen rather than
-  guaranteeing it never returns in any future form.
-- **Always Show All Tray Icons** — a toggle that stops Windows hiding
-  system-tray icons in the overflow menu behind the up-arrow, so every
-  notification-area icon stays visible on the taskbar. Applying it
-  restarts Explorer (the taskbar briefly disappears and comes back).
-  Caveat: on Windows 11 some apps' per-app overflow settings can still
-  override this, so it is the closest thing to a global switch, not a
-  guaranteed override for every app.
-- **Windows Annoyances Reset to defaults** — a button at the bottom of
-  the Windows Annoyances section that restores Windows' own defaults:
-  forced shutdown OFF, welcome experience ON (the post-update setup
-  screen is allowed again — that is the Windows default, even though
-  you will usually have it off), and show all tray icons OFF. If the
-  tray-icons state changed, Explorer restarts once so the taskbar
-  picks it up.
-- Shortcuts are named "Utility Closet" (not "The Utility Closet") on the
-  desktop and in the Start Menu; installing v1.0.7 also removes the old
-  "The Utility Closet" shortcuts.
-- Follows the Windows light/dark app theme. Custom closet icon.
+- **Windows Annoyances** — Force shutdown / restart (no warning),
+  Instantly close frozen apps, Windows welcome experience, Always show
+  all tray icons, Microsoft Copilot (off uninstalls the app, on
+  reinstalls it via winget; Microsoft 365 Copilot left alone), and
+  Reset to defaults covering every toggle on the page.
+- **Log + Copy Log**, **Check for updates** (downloads the installer
+  and launches it, then exits so it can replace the app), **About**.
+- Follows the Windows light/dark app theme. Teal accent, sidebar
+  navigation + Overview dashboard.
 
-## Build from source
-
-On Windows (install Rust via [rustup](https://rustup.rs/) first):
-
-```powershell
-cargo build --release
-```
-
-Cross-compile from Linux:
-
-```bash
-# mingw-w64 provides the linker and windres
-sudo apt install mingw-w64
-rustup target add x86_64-pc-windows-gnu
-# make sure a `windres` binary is on PATH, e.g.:
-#   sudo ln -s /usr/bin/x86_64-w64-mingw32-windres /usr/local/bin/windres
-cargo build --release --target x86_64-pc-windows-gnu
-```
-
-The build script compiles `assets/UtilityCloset.rc` with windres and links the
-resulting object directly, embedding the exe icon and the
-`requireAdministrator` manifest.
+Windows-only. No Mac port, by design.
 
 ## Project layout
 
 ```
 UtilityCloset/
-├── src/main.rs            # the whole app (egui)
-├── build.rs               # embeds icon + admin manifest via windres
-├── assets/
-│   ├── UtilityCloset.ico        # exe / window icon
-│   ├── UtilityCloset.manifest   # requireAdministrator manifest
-│   └── icon.png                 # runtime window icon (from the .ico)
-└── Cargo.toml
+├── lib/main.dart          # Flutter UI (1:1 with egui, same sections/labels/buttons)
+├── lib/rust_bridge.dart   # Manual C-ABI FFI bridge (NOT flutter_rust_bridge)
+├── rust/src/lib.rs        # Rust core (cdylib utility_closet_core.dll)
+├── rust/Cargo.toml
+├── installer/installer.nsi # NSIS admin installer
+├── assets/                # icon, manifest (requireAdministrator)
+└── .github/workflows/windows.yml  # Windows build (added via web UI)
 ```
+
+## Build from source (Windows)
+
+See `.github/workflows/windows.yml` for the exact steps: build the Rust
+core with `cargo build --release --manifest-path rust/Cargo.toml`, then
+`flutter create --platforms=windows`, copy `lib/` + `pubspec.yaml`,
+patch the runner manifest to `requireAdministrator`, build with
+`flutter build windows --release`, copy `utility_closet_core.dll` into
+the Release folder, zip, and run the NSIS installer.
 
 ## License
 
