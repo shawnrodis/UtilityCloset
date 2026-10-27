@@ -888,34 +888,49 @@ fn unpin_copilot_from_taskbar() -> bool {
 /// read from the Shell Folders registry value (which follows OneDrive
 /// redirection) with a USERPROFILE\Documents fallback.
 fn backup_dir() -> std::path::PathBuf {
-    let mut docs: Option<std::path::PathBuf> = None;
-    if let Ok(out) = Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-            "/v",
-            "Personal",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if line.contains("Personal") {
-                if let Some(v) = line.split("REG_SZ").nth(1) {
-                    let v = v.trim();
-                    if !v.is_empty() {
-                        docs = Some(std::path::PathBuf::from(v));
+    // Cached after the first call (OnceLock): the old version ran
+    // `reg query` on EVERY call, and the Overview and Backup pages
+    // call backup_file_path() on EVERY FRAME to show "Backups live
+    // in…". That was a reg.exe spawn + wait per frame on the UI
+    // thread — 60 processes a second — which is why dragging the
+    // window stuttered on an otherwise fast PC (window moves only
+    // redraw when the app frames, so a blocked UI thread makes
+    // the window trail the cursor). The Documents path does not
+    // change during a run (a OneDrive redirection change needs a
+    // restart anyway), so caching it is safe.
+    static CACHED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let mut docs: Option<std::path::PathBuf> = None;
+            if let Ok(out) = Command::new("reg")
+                .args([
+                    "query",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+                    "/v",
+                    "Personal",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    if line.contains("Personal") {
+                        if let Some(v) = line.split("REG_SZ").nth(1) {
+                            let v = v.trim();
+                            if !v.is_empty() {
+                                docs = Some(std::path::PathBuf::from(v));
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
-    let base = docs.unwrap_or_else(|| {
-        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
-        std::path::PathBuf::from(home).join("Documents")
-    });
-    base.join("Utility Closet")
+            let base = docs.unwrap_or_else(|| {
+                let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+                std::path::PathBuf::from(home).join("Documents")
+            });
+            base.join("Utility Closet")
+        })
+        .clone()
 }
 
 fn backup_file_path() -> std::path::PathBuf {
@@ -1134,6 +1149,15 @@ impl ClosetApp {
 
     fn log_line(&mut self, msg: &str) {
         self.log.push_str(&format!("[{}] {}\n", timestamp(), msg));
+        // Keep the log bounded: the Log page re-lays out the whole
+        // text every frame, so an unbounded log gets slower the
+        // longer the app runs. Keep the newest ~32 KB.
+        if self.log.len() > 49152 {
+            let cut = self.log.len() - 32768;
+            if let Some(pos) = self.log[cut..].find('\n') {
+                self.log.drain(..cut + pos + 1);
+            }
+        }
     }
 
     fn load_config(&mut self) {
