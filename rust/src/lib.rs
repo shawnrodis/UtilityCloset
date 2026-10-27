@@ -52,7 +52,7 @@ use std::time::Duration;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MAX_DRIVES: usize = 12;
 const MAX_PRINTERS: usize = 6;
-const APP_VERSION: &str = "1.1.2";
+const APP_VERSION: &str = "1.1.3";
 const UPDATE_REPO: &str = "shawnrodis/UtilityCloset";
 const DESKTOP_KEY: &str = r"HKCU\Control Panel\Desktop";
 
@@ -1994,7 +1994,7 @@ pub extern "C" fn uc_free_string(ptr: *mut c_char) {
 
 #[no_mangle]
 pub extern "C" fn uc_version() -> *mut c_char {
-    string_to_ptr("1.1.2-rust".to_string())
+    string_to_ptr("1.1.3-rust".to_string())
 }
 
 #[no_mangle]
@@ -2457,7 +2457,7 @@ mod tests {
         let doc = backup_doc(vec![], vec![], monitors.clone(), vec![]);
         assert_eq!(doc["format"], "UtilityClosetBackup");
         assert_eq!(doc["version"], 1);
-        assert_eq!(doc["app_version"], "1.1.2");
+        assert_eq!(doc["app_version"], "1.1.3");
         assert_eq!(doc["monitors"][0]["device"], r"\\.\DISPLAY1");
         // Summary lines match the egui format.
         let summary = monitor_summary(&monitors);
