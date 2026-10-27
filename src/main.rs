@@ -504,6 +504,118 @@ fn apply_copilot_enabled(on: bool) -> bool {
     ok
 }
 
+/// Remove the pinned Copilot app icon from the taskbar, best-effort.
+/// The policy + button values above do not touch the pinned app
+/// icon — that pin lives as a shortcut in the per-user pinned-taskbar
+/// folder, and Explorer rebuilds the taskbar pins from that folder
+/// on restart. Deleting the Copilot link (matched by name, so no
+/// other pin is touched) removes the pin. Returns true if a link
+/// was removed. This deliberately does NOT touch the Taskband
+/// registry blob: that binary format is undocumented, and a bad edit
+/// there can wipe every pinned icon at once. If no link is found
+/// (some builds keep pins only in Taskband), the caller tells the
+/// user to unpin manually with right-click -> Unpin from taskbar.
+fn unpin_copilot_from_taskbar() -> bool {
+    let appdata = match std::env::var("APPDATA") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let dir = std::path::Path::new(&appdata)
+        .join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.contains("copilot") && name.ends_with(".lnk") {
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed = true;
+            }
+        }
+    }
+    removed
+}
+
+/// The app's backup folder: Documents\Utility Closet. Documents is
+/// read from the Shell Folders registry value (which follows OneDrive
+/// redirection) with a USERPROFILE\Documents fallback.
+fn backup_dir() -> std::path::PathBuf {
+    let mut docs: Option<std::path::PathBuf> = None;
+    if let Ok(out) = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            "/v",
+            "Personal",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if line.contains("Personal") {
+                if let Some(v) = line.split("REG_SZ").nth(1) {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        docs = Some(std::path::PathBuf::from(v));
+                    }
+                }
+            }
+        }
+    }
+    let base = docs.unwrap_or_else(|| {
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(home).join("Documents")
+    });
+    base.join("Utility Closet")
+}
+
+fn backup_file_path() -> std::path::PathBuf {
+    backup_dir().join("UtilityCloset-Backup.json")
+}
+
+/// Run a PowerShell snippet hidden and return its stdout (trimmed).
+/// Used for live system snapshots (drives, printers, monitors).
+fn run_ps(script: &str) -> Result<String, String> {
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to run PowerShell: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A serde_json value that may be a single object or an array of
+/// objects (ConvertTo-Json emits an object, not an array, for one
+/// item) — always returned as an array.
+fn json_array(v: serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Null => Vec::new(),
+        other => vec![other],
+    }
+}
+
+fn json_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_bool(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
+    v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
+}
+
 impl ClosetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(if is_dark_mode() {
@@ -843,6 +955,385 @@ impl ClosetApp {
             &["printui.dll,PrintUIEntry", "/y", "/n", &name],
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Backup & Restore — Documents\Utility Closet\UtilityCloset-Backup.json
+    //
+    // Export snapshots the LIVE system, not just what is typed into
+    // the app: currently mapped network drives (Get-SmbMapping),
+    // currently installed printers (Get-Printer), and the full display
+    // topology (Screen::AllScreens + video controllers). App rows
+    // that are not currently live are added too, so nothing typed
+    // into the app is lost. Import restores drives and printers
+    // immediately; monitors are applied live per display (see
+    // apply_monitor_layout), with missing displays skipped.
+    // -----------------------------------------------------------------------
+
+    fn export_backup(&mut self) {
+        let dir = backup_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.log_line(&format!("Could not create backup folder {}: {e}", dir.display()));
+            return;
+        }
+        // Live mapped drives.
+        let mut drives: Vec<serde_json::Value> = Vec::new();
+        match run_ps(
+            "Get-SmbMapping | Select-Object LocalPath,RemotePath,Status | ConvertTo-Json -Compress",
+        ) {
+            Ok(text) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for item in json_array(v) {
+                        let letter = json_str(&item, "LocalPath")
+                            .trim_end_matches(':')
+                            .to_string();
+                        let path = json_str(&item, "RemotePath");
+                        if !letter.is_empty() && !path.is_empty() {
+                            drives.push(serde_json::json!({
+                                "letter": letter,
+                                "path": path,
+                                "source": "live",
+                                "status": json_str(&item, "Status"),
+                            }));
+                        }
+                    }
+                }
+            }
+            Err(e) => self.log_line(&format!("Live drive snapshot failed ({e}) — app rows only.")),
+        }
+        // App drive rows not already live.
+        for row in &self.drives {
+            let path = row.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let Some(letter) = Self::normalized_letter(&row.letter) else {
+                continue;
+            };
+            if drives.iter().any(|d| json_str(d, "letter") == letter) {
+                continue;
+            }
+            drives.push(serde_json::json!({
+                "letter": letter, "path": path, "source": "app", "status": "",
+            }));
+        }
+        // Live installed printers.
+        let mut printers: Vec<serde_json::Value> = Vec::new();
+        match run_ps(
+            "Get-Printer | Select-Object Name,PortName,DriverName,Shared | ConvertTo-Json -Compress",
+        ) {
+            Ok(text) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for item in json_array(v) {
+                        let name = json_str(&item, "Name");
+                        if name.is_empty() {
+                            continue;
+                        }
+                        printers.push(serde_json::json!({
+                            "name": name,
+                            "port": json_str(&item, "PortName"),
+                            "driver": json_str(&item, "DriverName"),
+                            "shared": json_bool(&item, "Shared"),
+                            "source": "live",
+                        }));
+                    }
+                }
+            }
+            Err(e) => self.log_line(&format!("Live printer snapshot failed ({e}) — app rows only.")),
+        }
+        // Queued printer rows not already live (by port).
+        for row in &self.printer_rows {
+            let path = row.path.trim();
+            if path.is_empty() || printers.iter().any(|p| json_str(p, "port") == path) {
+                continue;
+            }
+            printers.push(serde_json::json!({
+                "name": path, "port": path, "driver": "", "shared": false, "source": "app",
+            }));
+        }
+        // Full display topology: screens + video controllers.
+        let mut monitors: Vec<serde_json::Value> = Vec::new();
+        match run_ps(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.Screen]::AllScreens | Select-Object DeviceName,Primary, \
+             @{N='X';E={$_.Bounds.X}}, @{N='Y';E={$_.Bounds.Y}}, \
+             @{N='Width';E={$_.Bounds.Width}}, @{N='Height';E={$_.Bounds.Height}}, \
+             @{N='BitsPerPixel';E={$_.BitsPerPixel}} | ConvertTo-Json -Compress",
+        ) {
+            Ok(text) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    for item in json_array(v) {
+                        monitors.push(serde_json::json!({
+                            "device": json_str(&item, "DeviceName"),
+                            "primary": json_bool(&item, "Primary"),
+                            "x": json_i64(&item, "X"),
+                            "y": json_i64(&item, "Y"),
+                            "width": json_i64(&item, "Width"),
+                            "height": json_i64(&item, "Height"),
+                            "bits": json_i64(&item, "BitsPerPixel"),
+                        }));
+                    }
+                }
+            }
+            Err(e) => self.log_line(&format!("Monitor snapshot failed: {e}")),
+        }
+        let mut controllers: Vec<serde_json::Value> = Vec::new();
+        if let Ok(text) = run_ps(
+            "Get-CimInstance Win32_VideoController | Select-Object Name,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate,CurrentBitsPerPixel | ConvertTo-Json -Compress",
+        ) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                for item in json_array(v) {
+                    controllers.push(serde_json::json!({
+                        "name": json_str(&item, "Name"),
+                        "width": json_i64(&item, "CurrentHorizontalResolution"),
+                        "height": json_i64(&item, "CurrentVerticalResolution"),
+                        "refresh": json_i64(&item, "CurrentRefreshRate"),
+                        "bits": json_i64(&item, "CurrentBitsPerPixel"),
+                    }));
+                }
+            }
+        }
+        // Display registry keys as a fallback: if the live monitor
+        // apply ever fails, these .reg files restore the layout the
+        // old way (import + restart). Best-effort, failures only logged.
+        for (key, file) in [
+            (
+                r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration",
+                "Display-Configuration.reg",
+            ),
+            (
+                r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Connectivity",
+                "Display-Connectivity.reg",
+            ),
+            (
+                r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\ScaleFactors",
+                "Display-ScaleFactors.reg",
+            ),
+        ] {
+            let target = dir.join(file);
+            let _ = Command::new("reg")
+                .args(["export", key, &target.to_string_lossy(), "/y"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+        let doc = serde_json::json!({
+            "format": "UtilityClosetBackup",
+            "version": 1,
+            "app_version": APP_VERSION,
+            "exported": timestamp(),
+            "drives": drives,
+            "printers": printers,
+            "monitors": monitors,
+            "video_controllers": controllers,
+        });
+        let path = backup_file_path();
+        match std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+            Ok(_) => {
+                self.log_line(&format!(
+                    "Backup exported to {}: {} drive(s), {} printer(s), {} monitor(s).",
+                    path.display(),
+                    doc["drives"].as_array().map(|a| a.len()).unwrap_or(0),
+                    doc["printers"].as_array().map(|a| a.len()).unwrap_or(0),
+                    doc["monitors"].as_array().map(|a| a.len()).unwrap_or(0),
+                ));
+            }
+            Err(e) => self.log_line(&format!("Failed to write backup {}: {e}", path.display())),
+        }
+    }
+
+    /// Apply a backed-up monitor layout live, per display, via
+    /// ChangeDisplaySettingsEx. Displays in the backup that are not
+    /// currently connected are skipped, never forced. The primary
+    /// display gets CDS_SET_PRIMARY. Returns nothing; every outcome
+    /// is logged, and a total failure leaves the layout unchanged
+    /// (the .reg files in the backup folder are the fallback).
+    fn apply_monitor_layout(&mut self, monitors: &[serde_json::Value]) {
+        if monitors.is_empty() {
+            self.log_line("Backup has no monitors — monitor layout skipped.");
+            return;
+        }
+        let payload = serde_json::to_string(monitors).unwrap_or_default();
+        // PowerShell + user32 P/Invoke. DEVMODE layout matches the
+        // Win32 struct through dmDisplayFrequency + dmPosition;
+        // dmSize is set from the marshalled size at runtime.
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class Disp {{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINTL {{ public int x; public int y; }}
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DEVMODE {{
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields;
+        public short dmOrientation; public short dmPaperSize; public short dmPaperLength; public short dmPaperWidth; public short dmScale; public short dmCopies; public short dmDefaultSource; public short dmPrintQuality;
+        public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+        public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
+        public POINTL dmPosition;
+    }}
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DISPLAY_DEVICE {{
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }}
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern int ChangeDisplaySettingsEx(string lpszDeviceName, ref DEVMODE lpDevMode, IntPtr hwnd, uint dwflags, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(IntPtr devMode, uint flags);
+}}
+'@
+Add-Type -TypeDefinition $code
+$monitors = '{payload}' | ConvertFrom-Json
+if ($monitors -isnot [array]) {{ $monitors = @($monitors) }}
+$results = @()
+for ($i = 0; $true; $i++) {{
+    $dd = New-Object Disp+DISPLAY_DEVICE; $dd.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($dd)
+    if (-not [Disp]::EnumDisplayDevices($null, $i, [ref]$dd, 0)) {{ break }}
+    $want = $monitors | Where-Object {{ $_.device -eq $dd.DeviceName }} | Select-Object -First 1
+    if (-not $want) {{ $results += "$($dd.DeviceName): not in backup, skipped"; continue }}
+    $dm = New-Object Disp+DEVMODE; $dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)
+    if (-not [Disp]::EnumDisplaySettings($dd.DeviceName, -1, [ref]$dm)) {{ $results += "$($dd.DeviceName): could not read current mode"; continue }}
+    $dm.dmFields = 0x20 -bor 0x80000 -bor 0x100000
+    $dm.dmPelsWidth = [int]$want.width; $dm.dmPelsHeight = [int]$want.height
+    $dm.dmPosition = New-Object Disp+POINTL; $dm.dmPosition.x = [int]$want.x; $dm.dmPosition.y = [int]$want.y
+    if ([int]$want.bits -gt 0) {{ $dm.dmFields = $dm.dmFields -bor 0x40000; $dm.dmBitsPerPel = [int]$want.bits }}
+    $flags = 1 -bor 0x10000000
+    if ($want.primary) {{ $flags = $flags -bor 0x10 }}
+    $rc = [Disp]::ChangeDisplaySettingsEx($dd.DeviceName, [ref]$dm, [IntPtr]::Zero, $flags, [IntPtr]::Zero)
+    $results += "$($dd.DeviceName): ChangeDisplaySettingsEx = $rc (0 = success)"
+}}
+[void][Disp]::ChangeDisplaySettings([IntPtr]::Zero, 0)
+$results -join "`n"
+"#,
+            payload = payload.replace('\'', "''")
+        );
+        let tmp = std::env::temp_dir().join("UtilityCloset-MonitorRestore.ps1");
+        match std::fs::write(&tmp, &script) {
+            Ok(_) => match Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    &tmp.to_string_lossy(),
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if !line.trim().is_empty() {
+                            self.log_line(&format!("Monitor: {line}"));
+                        }
+                    }
+                    if !out.status.success() {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        for line in err.lines() {
+                            if !line.trim().is_empty() {
+                                self.log_line(&format!("Monitor restore error: {line}"));
+                            }
+                        }
+                        self.log_line(
+                            "Monitor layout may not have applied — the Display-*.reg files in the backup folder are the fallback (import + restart).",
+                        );
+                    }
+                }
+                Err(e) => self.log_line(&format!("Failed to run monitor restore: {e}")),
+            },
+            Err(e) => self.log_line(&format!("Failed to write monitor restore script: {e}")),
+        }
+    }
+
+    fn import_backup(&mut self) {
+        let path = backup_file_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => {
+                self.log_line(&format!(
+                    "No backup found at {} — export one first.",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.log_line(&format!("Backup file is not readable JSON: {e}"));
+                return;
+            }
+        };
+        if json_str(&doc, "format") != "UtilityClosetBackup" {
+            self.log_line("This file is not a Utility Closet backup — import cancelled.");
+            return;
+        }
+        // Drives: replace app rows, save, then map (live restore).
+        let drives = json_array(doc.get("drives").cloned().unwrap_or(serde_json::Value::Null));
+        if !drives.is_empty() {
+            self.drives = drives
+                .iter()
+                .filter_map(|d| {
+                    let letter = json_str(d, "letter");
+                    let p = json_str(d, "path");
+                    if letter.is_empty() || p.is_empty() {
+                        None
+                    } else {
+                        Some(DriveRow { letter, path: p })
+                    }
+                })
+                .take(MAX_DRIVES)
+                .collect();
+            self.save_config();
+            self.log_line(&format!("Restoring {} drive(s) from backup ...", self.drives.len()));
+            self.map_drives();
+        } else {
+            self.log_line("Backup has no drives — drive restore skipped.");
+        }
+        // Printers: only network (UNC) ports can be added by this
+        // app's printer tool; local/IP printers are logged, not forced.
+        let printers = json_array(doc.get("printers").cloned().unwrap_or(serde_json::Value::Null));
+        let mut to_add: Vec<String> = Vec::new();
+        for p in &printers {
+            let port = json_str(p, "port");
+            let target = if port.starts_with(r"\\") {
+                port
+            } else {
+                let name = json_str(p, "name");
+                if name.starts_with(r"\\") {
+                    name
+                } else {
+                    String::new()
+                }
+            };
+            if !target.is_empty() && !to_add.contains(&target) {
+                to_add.push(target);
+            }
+        }
+        if !to_add.is_empty() {
+            self.printer_rows = to_add
+                .iter()
+                .take(MAX_PRINTERS)
+                .map(|p| PrinterRow { path: p.clone() })
+                .collect();
+            self.log_line(&format!("Restoring {} network printer(s) from backup ...", to_add.len()));
+            self.add_printers();
+        } else {
+            self.log_line("Backup has no network printers to add — printer restore skipped (local printers are not added by UNC path).");
+        }
+        // Monitors: live apply, missing displays skipped.
+        let monitors = json_array(doc.get("monitors").cloned().unwrap_or(serde_json::Value::Null));
+        self.apply_monitor_layout(&monitors);
+        self.log_line(&format!("Import complete from {}.", path.display()));
+    }
 }
 
 impl eframe::App for ClosetApp {
@@ -969,8 +1460,22 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(4.0);
 
+                // Status at a glance — live state the app already knows,
+                // so you do not have to read the log to see it.
+                ui.horizontal(|ui| {
+                    let drives_configured = self.drives.iter().filter(|r| !r.path.trim().is_empty()).count();
+                    ui.label(egui::RichText::new(format!(
+                        "Status: {} drive(s) configured \u{00b7} {} printer(s) listed \u{00b7} Forced shutdown {} \u{00b7} Copilot {}",
+                        drives_configured,
+                        self.printers.len(),
+                        if self.forced_shutdown { "on" } else { "off" },
+                        if self.copilot_enabled { "on" } else { "off" },
+                    )).strong());
+                });
+                ui.label("Printer count updates when you click Refresh List in the Printers section.");
+
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Network Drives").strong());
+                    ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     let mut remove_idx: Option<usize> = None;
                     for (i, row) in self.drives.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
@@ -1016,7 +1521,7 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Printers").strong());
+                    ui.label(egui::RichText::new("Printers").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     // Bulk-add rows, just like Network Drives: queue up
                     // paths, then add them all at once.
                     let mut remove_idx: Option<usize> = None;
@@ -1079,7 +1584,44 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("System File Checker").strong());
+                    ui.label(egui::RichText::new("Backup & Restore").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+                    ui.horizontal(|ui| {
+                        if ui.button("Export Backup").clicked() {
+                            self.export_backup();
+                        }
+                        if ui.button("Import Backup").clicked() {
+                            self.import_backup();
+                        }
+                        if ui.button("Open Backup Folder").clicked() {
+                            let dir = backup_dir();
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = Command::new("explorer.exe")
+                                .arg(dir)
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .spawn();
+                        }
+                    });
+                    ui.label(format!(
+                        "Saves to {}",
+                        backup_file_path().display()
+                    ));
+                    ui.label(
+                        "Export snapshots what is actually on this PC right now: \
+                         mapped network drives, installed printers, and the full \
+                         monitor layout (position, size, primary display) — plus \
+                         any drive/printer rows typed into the app that are not \
+                         currently live. Import maps those drives back, re-adds \
+                         the network printers, and applies the monitor layout to \
+                         displays that are currently connected (missing displays \
+                         are skipped, never forced). Display registry keys are \
+                         also saved as Display-*.reg files in the same folder as \
+                         a fallback.",
+                    );
+                });
+
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("System File Checker").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     ui.horizontal(|ui| {
                         if ui.button("Run SFC Scan").clicked() {
                             self.run_sfc();
@@ -1093,7 +1635,7 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("DISM — Windows Image Repair").strong());
+                    ui.label(egui::RichText::new("DISM — Windows Image Repair").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     ui.horizontal(|ui| {
                         if ui.button("Check Health").clicked() {
                             self.run_dism(
@@ -1132,7 +1674,7 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Display Cache").strong());
+                    ui.label(egui::RichText::new("Display Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     ui.horizontal(|ui| {
                         if ui.button("Clear & Reset Display Cache").clicked() {
                             self.confirm = Some(Confirm::DisplayCache);
@@ -1146,7 +1688,7 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Icon Cache").strong());
+                    ui.label(egui::RichText::new("Icon Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     ui.horizontal(|ui| {
                         if ui.button("Rebuild Icon Cache").clicked() {
                             self.confirm = Some(Confirm::IconCache);
@@ -1161,7 +1703,7 @@ impl eframe::App for ClosetApp {
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Windows Annoyances").strong(),
+                        egui::RichText::new("Windows Annoyances").strong().color(egui::Color32::from_rgb(0, 128, 140)),
                     );
                     // Applies immediately on click — no separate Apply
                     // button. If writing the registry fails, revert the
@@ -1326,6 +1868,18 @@ impl eframe::App for ClosetApp {
                                     "Microsoft Copilot OFF: the Copilot policy is \
                                      set and the taskbar Copilot button is hidden.",
                                 );
+                                if unpin_copilot_from_taskbar() {
+                                    self.log_line(
+                                        "Copilot taskbar pin removed — the pinned \
+                                         Copilot app icon will be gone once Explorer restarts.",
+                                    );
+                                } else {
+                                    self.log_line(
+                                        "No Copilot taskbar pin link found — if the \
+                                         Copilot icon is still on the taskbar, right-click \
+                                         it and choose Unpin from taskbar.",
+                                    );
+                                }
                             }
                             self.log_line(
                                 "Restarting Explorer so the taskbar picks this up \
@@ -1358,7 +1912,10 @@ impl eframe::App for ClosetApp {
                          app, which stays installed and can still be opened on \
                          its own; and a major Windows update can occasionally \
                          reset policy keys, so the toggle may need a re-click \
-                         after one of those.",
+                         after one of those. Turning it off also removes the \
+                         pinned Copilot icon from the taskbar (best-effort, via \
+                         the pinned-shortcut folder); turning it back on does \
+                         not re-pin it — re-pin from Start if you want it back.",
                     );
                     ui.add_space(6.0);
                     // Reset to WINDOWS defaults — not the user's preferred
@@ -1437,7 +1994,7 @@ impl eframe::App for ClosetApp {
 
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Log").strong());
+                    ui.label(egui::RichText::new("Log").strong().color(egui::Color32::from_rgb(0, 128, 140)));
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.log)
@@ -1537,7 +2094,8 @@ impl eframe::App for ClosetApp {
                              • Windows welcome experience toggle\n\
                              • Always show all tray icons toggle\n\
                              • Windows Annoyances Reset to defaults\n\
-                             • Microsoft Copilot enable/disable toggle"
+                             • Microsoft Copilot enable/disable toggle\n\
+                             • Backup & restore (drives, printers, monitor layout) to Documents\\Utility Closet"
                         ),
                     );
                     ui.add_space(8.0);
