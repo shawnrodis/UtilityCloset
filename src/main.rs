@@ -30,7 +30,20 @@ enum Confirm {
     Reboot,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Nav {
+    Overview,
+    Drives,
+    Printers,
+    Backup,
+    Repairs,
+    Annoyances,
+    Log,
+}
+
 struct ClosetApp {
+    nav: Nav,
+    monitors_text: String,
     drives: Vec<DriveRow>,
     printer_rows: Vec<PrinterRow>,
     printers: Vec<String>,
@@ -475,6 +488,89 @@ fn is_copilot_enabled() -> bool {
     }
 }
 
+/// Is the standalone Microsoft Copilot app installed for this user?
+/// (Package family Microsoft.Copilot_8wekyb3d8bbwe; Microsoft 365
+/// Copilot is a different app and is deliberately left alone.)
+fn is_copilot_app_installed() -> bool {
+    match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-AppxPackage -Name 'Microsoft.Copilot*' | Select-Object -ExpandProperty Name",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Uninstall the Copilot app. Winget first (cleanest), then the
+/// AppxPackage route. Returns a human-readable outcome for the log.
+fn uninstall_copilot_app() -> String {
+    for id in [
+        "Microsoft.Copilot_8wekyb3d8bbwe",
+        "Microsoft.Copilot",
+    ] {
+        if let Ok(s) = Command::new("winget")
+            .args([
+                "uninstall",
+                "--id",
+                id,
+                "--silent",
+                "--accept-source-agreements",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+        {
+            if s.success() {
+                return format!("Copilot app uninstalled via winget ({id}).");
+            }
+        }
+    }
+    match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-AppxPackage -Name 'Microsoft.Copilot*' | Remove-AppxPackage -ErrorAction Continue; if (Get-AppxPackage -Name 'Microsoft.Copilot*') { exit 1 }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+    {
+        Ok(s) if s.success() => "Copilot app uninstalled (AppxPackage).".into(),
+        _ => "Copilot app uninstall did not confirm — it may still be installed; check Settings > Apps.".into(),
+    }
+}
+
+/// Reinstall the Copilot app via winget. Needs internet and can
+/// take a few minutes; the caller warns about that in the UI.
+/// Returns a human-readable outcome for the log.
+fn install_copilot_app() -> String {
+    for id in [
+        "Microsoft.Copilot_8wekyb3d8bbwe",
+        "Microsoft.Copilot",
+    ] {
+        if let Ok(s) = Command::new("winget")
+            .args([
+                "install",
+                "--id",
+                id,
+                "--silent",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+        {
+            if s.success() {
+                return format!("Copilot app reinstalled via winget ({id}).");
+            }
+        }
+    }
+    "Copilot app reinstall via winget did not confirm — install it from the Microsoft Store (search 'Microsoft Copilot') if it is still missing.".into()
+}
+
 fn apply_copilot_enabled(on: bool) -> bool {
     let (policy, button) = if on { ("0", "1") } else { ("1", "0") };
     let values = [
@@ -623,7 +719,31 @@ impl ClosetApp {
         } else {
             egui::Visuals::light()
         });
+        {
+            let mut style = (*cc.egui_ctx.style()).clone();
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(24.0, egui::FontFamily::Proportional),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::new(15.0, egui::FontFamily::Proportional),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(15.0, egui::FontFamily::Proportional),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Monospace,
+                egui::FontId::new(13.0, egui::FontFamily::Monospace),
+            );
+            style.visuals.selection.bg_fill = egui::Color32::from_rgb(0, 128, 140);
+            style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+            cc.egui_ctx.set_style(style);
+        }
         let mut app = Self {
+            nav: Nav::Overview,
+            monitors_text: String::new(),
             drives: Vec::new(),
             printer_rows: vec![PrinterRow { path: String::new() }],
             printers: Vec::new(),
@@ -969,6 +1089,137 @@ impl ClosetApp {
     // apply_monitor_layout), with missing displays skipped.
     // -----------------------------------------------------------------------
 
+    /// Fill the drive rows from the PC's currently mapped drives
+    /// (Get-SmbMapping), so the app stops looking blank on a PC
+    /// that already has drives mapped. Merges by letter, saves.
+    fn load_existing_drives(&mut self) {
+        match run_ps(
+            "Get-SmbMapping | Select-Object LocalPath,RemotePath | ConvertTo-Json -Compress",
+        ) {
+            Ok(text) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let mut loaded = 0;
+                    for item in json_array(v) {
+                        let letter = json_str(&item, "LocalPath")
+                            .trim_end_matches(':')
+                            .to_string();
+                        let path = json_str(&item, "RemotePath");
+                        if letter.is_empty() || path.is_empty() {
+                            continue;
+                        }
+                        if let Some(row) = self.drives.iter_mut().find(|r| {
+                            Self::normalized_letter(&r.letter).as_deref() == Some(letter.as_str())
+                        }) {
+                            row.path = path;
+                        } else if self.drives.len() < MAX_DRIVES {
+                            self.drives.push(DriveRow { letter, path });
+                        }
+                        loaded += 1;
+                    }
+                    // Drop blank placeholder rows if real drives
+                    // were loaded (the fresh-start X row).
+                    if loaded > 0 {
+                        let has_real = self.drives.iter().any(|x| !x.path.trim().is_empty());
+                        if has_real {
+                            self.drives.retain(|r| !r.path.trim().is_empty());
+                        }
+                    }
+                    self.save_config();
+                    self.log_line(&format!("Loaded {loaded} existing mapped drive(s) into the list."));
+                } else {
+                    self.log_line("Could not read existing mapped drives.");
+                }
+            }
+            Err(e) => self.log_line(&format!("Failed to list existing mapped drives: {e}")),
+        }
+    }
+
+    /// Detect the current monitors (full topology, same query as
+    /// Export uses) and show them in the Backup section. Also
+    /// writes Documents\Utility Closet\Monitor-Layout.json so the
+    /// layout can be applied on its own, without a full backup.
+    fn detect_monitors(&mut self) {
+        match run_ps(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.Screen]::AllScreens | Select-Object DeviceName,Primary, \
+             @{N='X';E={$_.Bounds.X}}, @{N='Y';E={$_.Bounds.Y}}, \
+             @{N='Width';E={$_.Bounds.Width}}, @{N='Height';E={$_.Bounds.Height}}, \
+             @{N='BitsPerPixel';E={$_.BitsPerPixel}} | ConvertTo-Json -Compress",
+        ) {
+            Ok(text) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let monitors: Vec<serde_json::Value> = json_array(v)
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "device": json_str(item, "DeviceName"),
+                                "primary": json_bool(item, "Primary"),
+                                "x": json_i64(item, "X"),
+                                "y": json_i64(item, "Y"),
+                                "width": json_i64(item, "Width"),
+                                "height": json_i64(item, "Height"),
+                                "bits": json_i64(item, "BitsPerPixel"),
+                            })
+                        })
+                        .collect();
+                    let mut summary = String::new();
+                    for m in &monitors {
+                        summary.push_str(&format!(
+                            "{} — {}x{} at ({}, {}){}\n",
+                            json_str(m, "device"),
+                            json_i64(m, "width"),
+                            json_i64(m, "height"),
+                            json_i64(m, "x"),
+                            json_i64(m, "y"),
+                            if json_bool(m, "primary") { " (primary)" } else { "" },
+                        ));
+                    }
+                    self.monitors_text = summary;
+                    let dir = backup_dir();
+                    if std::fs::create_dir_all(&dir).is_ok() {
+                        let doc = serde_json::json!({
+                            "format": "UtilityClosetMonitorLayout",
+                            "version": 1,
+                            "computer": std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
+                            "exported": timestamp(),
+                            "monitors": monitors,
+                        });
+                        let path = dir.join("Monitor-Layout.json");
+                        if std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default()).is_ok() {
+                            self.log_line(&format!(
+                                "Detected {} monitor(s); layout saved to {}.",
+                                doc["monitors"].as_array().map(|a| a.len()).unwrap_or(0),
+                                path.display()
+                            ));
+                        }
+                    }
+                } else {
+                    self.log_line("Could not read monitor layout.");
+                }
+            }
+            Err(e) => self.log_line(&format!("Monitor detection failed: {e}")),
+        }
+    }
+
+    fn apply_monitor_layout_file(&mut self) {
+        let dir = backup_dir();
+        let standalone = dir.join("Monitor-Layout.json");
+        let text = std::fs::read_to_string(&standalone)
+            .or_else(|_| {
+                std::fs::read_to_string(backup_file_path())
+            });
+        match text {
+            Ok(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+                Ok(doc) => {
+                    let monitors = json_array(doc.get("monitors").cloned().unwrap_or(serde_json::Value::Null));
+                    self.apply_monitor_layout(&monitors);
+                }
+                Err(e) => self.log_line(&format!("Monitor layout file is not readable JSON: {e}")),
+            },
+            Err(_) => self.log_line("No monitor layout saved yet — click Detect Monitors first."),
+        }
+    }
+
     fn export_backup(&mut self) {
         let dir = backup_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1119,6 +1370,7 @@ impl ClosetApp {
             "format": "UtilityClosetBackup",
             "version": 1,
             "app_version": APP_VERSION,
+            "computer": std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
             "exported": timestamp(),
             "drives": drives,
             "printers": printers,
@@ -1276,6 +1528,13 @@ $results -join "`n"
             self.log_line("This file is not a Utility Closet backup — import cancelled.");
             return;
         }
+        let backup_pc = json_str(&doc, "computer");
+        let this_pc = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
+        if !backup_pc.is_empty() && backup_pc != "unknown" && backup_pc != this_pc {
+            self.log_line(&format!(
+                "Warning: this backup is from PC '{backup_pc}', but this PC is '{this_pc}' — drives, printers, and monitors may differ. Restoring anyway."
+            ));
+        }
         // Drives: replace app rows, save, then map (live restore).
         let drives = json_array(doc.get("drives").cloned().unwrap_or(serde_json::Value::Null));
         if !drives.is_empty() {
@@ -1334,6 +1593,659 @@ $results -join "`n"
         self.apply_monitor_layout(&monitors);
         self.log_line(&format!("Import complete from {}.", path.display()));
     }
+    fn section_overview(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Overview");
+        ui.label("Everything at a glance — pick a section on the left for the full controls.");
+        ui.add_space(8.0);
+        let drives_configured = self.drives.iter().filter(|r| !r.path.trim().is_empty()).count();
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(format!("{drives_configured} drive(s) configured in the app."));
+            if ui.button("Open Network Drives").clicked() {
+                self.nav = Nav::Drives;
+            }
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Printers").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(format!("{} printer(s) listed (Refresh List updates this).", self.printers.len()));
+            ui.horizontal(|ui| {
+                if ui.button("Refresh List").clicked() {
+                    self.refresh_printers();
+                }
+                if ui.button("Open Printers").clicked() {
+                    self.nav = Nav::Printers;
+                }
+            });
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Backup & Restore").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(format!("Backups live in {}", backup_file_path().display()));
+            ui.horizontal(|ui| {
+                if ui.button("Export Backup").clicked() {
+                    self.export_backup();
+                }
+                if ui.button("Open Backup").clicked() {
+                    self.nav = Nav::Backup;
+                }
+            });
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Windows Annoyances").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(format!(
+                "Forced shutdown {} \u{00b7} Welcome experience {} \u{00b7} Tray icons {} \u{00b7} Copilot {}",
+                if self.forced_shutdown { "on" } else { "off" },
+                if self.welcome_experience { "on" } else { "off" },
+                if self.show_all_tray_icons { "all shown" } else { "normal" },
+                if self.copilot_enabled { "on" } else { "off" },
+            ));
+            if ui.button("Open Windows Annoyances").clicked() {
+                self.nav = Nav::Annoyances;
+            }
+        });
+    }
+
+    fn section_drives(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            let mut remove_idx: Option<usize> = None;
+            for (i, row) in self.drives.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.letter).desired_width(36.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.path)
+                            .desired_width(360.0)
+                            .hint_text(r"\\SERVER\share"),
+                    );
+                    if ui.button("Remove").clicked() {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove_idx {
+                self.drives.remove(i);
+            }
+            let (mut do_add, mut do_map, mut do_disco, mut do_load) = (false, false, false, false);
+            ui.horizontal(|ui| {
+                do_add = ui.button("Add Drive").clicked();
+                do_map = ui.button("Map Drives").clicked();
+                do_disco = ui.button("Disconnect").clicked();
+                do_load = ui.button("Load Existing").clicked();
+            });
+            if do_load {
+                self.load_existing_drives();
+            }
+            if do_add && self.drives.len() < MAX_DRIVES {
+                self.drives.push(DriveRow {
+                    letter: String::new(),
+                    path: String::new(),
+                });
+            }
+            if do_map {
+                self.map_drives();
+            }
+            if do_disco {
+                self.disconnect_drives();
+            }
+            ui.label(
+                "Paths start blank — enter yours. Add as many drives as you like; \
+                 the list is saved automatically. Load Existing pulls in drives \
+                 this PC already has mapped, so the list is never blank when \
+                 the PC already has network drives.",
+            );
+        });
+
+    }
+
+    fn section_printers(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Printers").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            // Bulk-add rows, just like Network Drives: queue up
+            // paths, then add them all at once.
+            let mut remove_idx: Option<usize> = None;
+            for (i, row) in self.printer_rows.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.path)
+                            .desired_width(360.0)
+                            .hint_text(r"\\SERVER\Printer"),
+                    );
+                    if ui.button("Remove").clicked() {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove_idx {
+                self.printer_rows.remove(i);
+            }
+            let (mut do_add_row, mut do_add_all, mut do_refresh) =
+                (false, false, false);
+            ui.horizontal(|ui| {
+                do_add_row = ui.button("Add Printer").clicked();
+                do_add_all = ui.button("Add Printers").clicked();
+                do_refresh = ui.button("Refresh List").clicked();
+            });
+            if do_add_row && self.printer_rows.len() < MAX_PRINTERS {
+                self.printer_rows.push(PrinterRow { path: String::new() });
+            }
+            if do_add_all {
+                self.add_printers();
+            }
+            if do_refresh {
+                self.refresh_printers();
+            }
+            if !self.printers.is_empty() {
+                egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                    for (i, name) in self.printers.iter().enumerate() {
+                        let selected = self.selected_printer == Some(i);
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.selected_printer = Some(i);
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Set as Default").clicked() {
+                        self.set_default_printer();
+                    }
+                    if ui.button("Remove Printer").clicked() {
+                        self.remove_printer();
+                    }
+                });
+            } else {
+                ui.label("No printers listed — click Refresh List to load them.");
+            }
+            ui.label(
+                "Queue up printer paths, then Add Printers adds them all at once. \
+                 Select a printer from the list below to set it as default or remove it.",
+            );
+        });
+
+    }
+
+    fn section_backup(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Backup & Restore").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Export Backup").clicked() {
+                    self.export_backup();
+                }
+                if ui.button("Import Backup").clicked() {
+                    self.import_backup();
+                }
+                if ui.button("Open Backup Folder").clicked() {
+                    let dir = backup_dir();
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = Command::new("explorer.exe")
+                        .arg(dir)
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                }
+            });
+            ui.label(format!(
+                "Saves to {}",
+                backup_file_path().display()
+            ));
+            ui.label(
+                "Export snapshots what is actually on this PC right now: \
+                 mapped network drives, installed printers, and the full \
+                 monitor layout (position, size, primary display) — plus \
+                 any drive/printer rows typed into the app that are not \
+                 currently live. Import maps those drives back, re-adds \
+                 the network printers, and applies the monitor layout to \
+                 displays that are currently connected (missing displays \
+                 are skipped, never forced). Display registry keys are \
+                 also saved as Display-*.reg files in the same folder as \
+                 a fallback.",
+            );
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Monitor Layout").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Detect Monitors").clicked() {
+                    self.detect_monitors();
+                }
+                if ui.button("Apply Monitor Layout").clicked() {
+                    self.apply_monitor_layout_file();
+                }
+            });
+            if self.monitors_text.is_empty() {
+                ui.label("Click Detect Monitors to list this PC's displays (device, resolution, position, primary) — that list is what gets backed up and restored.");
+            } else {
+                ui.label("Detected monitors:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.monitors_text)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            }
+            ui.label(
+                "Detect also saves Monitor-Layout.json in the backup folder, so \
+                 the layout can be applied on its own without a full backup. \
+                 Apply only affects displays that are currently connected; \
+                 missing displays are skipped, never forced.",
+            );
+        });
+
+    }
+
+    fn section_repairs(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("System File Checker").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Run SFC Scan").clicked() {
+                    self.run_sfc();
+                }
+                ui.label(
+                    "Scans and repairs protected Windows system files (sfc /scannow). \
+                     Runs in its own window — takes 10-20 minutes.",
+                );
+            });
+        });
+
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("DISM — Windows Image Repair").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Check Health").clicked() {
+                    self.run_dism(
+                        &["/Online", "/Cleanup-Image", "/CheckHealth"],
+                        "/Online /Cleanup-Image /CheckHealth",
+                    );
+                }
+                if ui.button("Scan Health").clicked() {
+                    self.run_dism(
+                        &["/Online", "/Cleanup-Image", "/ScanHealth"],
+                        "/Online /Cleanup-Image /ScanHealth",
+                    );
+                }
+                if ui.button("Restore Health").clicked() {
+                    self.run_dism(
+                        &["/Online", "/Cleanup-Image", "/RestoreHealth"],
+                        "/Online /Cleanup-Image /RestoreHealth",
+                    );
+                }
+            });
+            ui.label(
+                "Check Health is a quick check for whether the image has \
+                 been flagged as corrupted; Scan Health is a deeper scan \
+                 for component store damage. Restore Health repairs the \
+                 image, downloading replacement files via Windows Update — \
+                 it takes a while (10-20+ minutes) and needs an internet \
+                 connection for the download part. Each runs in its own \
+                 window so you can watch progress.",
+            );
+            ui.label(
+                "This is the same repair as the PowerShell alternative \
+                 (Repair-WindowsImage -Online -RestoreHealth) — no \
+                 separate PowerShell button is needed.",
+            );
+        });
+
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Display Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Clear & Reset Display Cache").clicked() {
+                    self.confirm = Some(Confirm::DisplayCache);
+                }
+                ui.label(
+                    "Deletes the GPU display configuration registry keys. \
+                     You MUST restart your PC afterward.",
+                );
+            });
+        });
+
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Icon Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.horizontal(|ui| {
+                if ui.button("Rebuild Icon Cache").clicked() {
+                    self.confirm = Some(Confirm::IconCache);
+                }
+                ui.label(
+                    "Deletes the icon cache and restarts Explorer. \
+                     Save all open work first.",
+                );
+            });
+        });
+
+    }
+
+    fn section_annoyances(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Windows Annoyances").strong().color(egui::Color32::from_rgb(0, 128, 140)),
+            );
+            // Applies immediately on click — no separate Apply
+            // button. If writing the registry fails, revert the
+            // toggle so it never claims a state it didn't set.
+            if ui
+                .checkbox(
+                    &mut self.forced_shutdown,
+                    "Force shutdown / restart (no warning)",
+                )
+                .changed()
+            {
+                let on = self.forced_shutdown;
+                if apply_forced_shutdown(on) {
+                    if on {
+                        self.log_line(
+                            "Forced shutdown ON: Windows will end open apps itself \
+                             after about 2 seconds instead of showing the \
+                             \"apps are preventing shutdown\" warning.",
+                        );
+                    } else {
+                        self.log_line(
+                            "Forced shutdown OFF: Windows will show the \
+                             \"apps are preventing shutdown\" warning again.",
+                        );
+                    }
+                } else {
+                    self.forced_shutdown = !on;
+                    self.log_line(
+                        "Failed to change the forced-shutdown setting — \
+                         the toggle was left unchanged.",
+                    );
+                }
+            }
+            ui.label(
+                "Changes what Windows' own Shut down / Restart buttons do: \
+                 with this on, Windows ends blocking apps itself instead of \
+                 stopping at the warning. Applies immediately — no reboot \
+                 needed — and takes effect the next time Windows is told \
+                 to shut down or restart.",
+            );
+            ui.label(
+                "Warning: with this on, unsaved work in open apps can be \
+                 lost, because Windows will no longer stop and ask.",
+            );
+            ui.add_space(6.0);
+            // Same immediate-apply, revert-on-failure pattern as
+            // the forced-shutdown toggle above.
+            if ui
+                .checkbox(
+                    &mut self.welcome_experience,
+                    "Windows welcome experience after updates",
+                )
+                .changed()
+            {
+                let on = self.welcome_experience;
+                if apply_welcome_experience(on) {
+                    if on {
+                        self.log_line(
+                            "Windows welcome experience ON: the post-update \
+                             setup screen may appear again.",
+                        );
+                    } else {
+                        self.log_line(
+                            "Windows welcome experience OFF: the post-update \
+                             setup screen is suppressed.",
+                        );
+                    }
+                } else {
+                    self.welcome_experience = !on;
+                    self.log_line(
+                        "Failed to change the welcome-experience setting — \
+                         the toggle was left unchanged.",
+                    );
+                }
+            }
+            ui.label(
+                "This is the white post-update setup screen (\"Let's finish \
+                 setting up your device\" / \"Get even more out of Windows\") \
+                 with OneDrive backup, Microsoft 365, and similar prompts. \
+                 Turning it off suppresses that screen.",
+            );
+            ui.label(
+                "Note: Microsoft can reintroduce new prompts in major \
+                 updates, so this suppresses the current screen rather than \
+                 guaranteeing it never returns in any future form.",
+            );
+            ui.add_space(6.0);
+            // Same immediate-apply, revert-on-failure pattern as
+            // the toggles above, plus the Explorer restart this
+            // change needs (same pattern as the icon-cache tool).
+            if ui
+                .checkbox(
+                    &mut self.show_all_tray_icons,
+                    "Always show all taskbar tray icons",
+                )
+                .changed()
+            {
+                let on = self.show_all_tray_icons;
+                if apply_show_all_tray_icons(on) {
+                    if on {
+                        self.log_line(
+                            "Show all tray icons ON: notification-area icons \
+                             will no longer hide in the overflow menu.",
+                        );
+                    } else {
+                        self.log_line(
+                            "Show all tray icons OFF: Windows will hide \
+                             inactive tray icons in the overflow menu again.",
+                        );
+                    }
+                    self.log_line(
+                        "Restarting Explorer so the taskbar picks this up \
+                         (the taskbar will briefly disappear and come back).",
+                    );
+                    let _ = Command::new("taskkill")
+                        .args(["/IM", "explorer.exe", "/F"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _ = Command::new("explorer.exe")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                } else {
+                    self.show_all_tray_icons = !on;
+                    self.log_line(
+                        "Failed to change the tray-icons setting — \
+                         the toggle was left unchanged.",
+                    );
+                }
+            }
+            ui.label(
+                "Stops Windows hiding system-tray icons in the overflow \
+                 menu behind the up-arrow, so every notification-area icon \
+                 stays visible on the taskbar. Applying this restarts \
+                 Explorer — the taskbar will briefly disappear and come back.",
+            );
+            ui.label(
+                "Caveat: on Windows 11 some apps' per-app overflow settings \
+                 can still override this, so it is the closest thing to a \
+                 global switch, not a guaranteed override for every app.",
+            );
+            ui.add_space(6.0);
+            // Same immediate-apply, revert-on-failure pattern as
+            // the toggles above, plus the Explorer restart this
+            // change needs (same pattern as the tray-icons toggle).
+            if ui
+                .checkbox(
+                    &mut self.copilot_enabled,
+                    "Microsoft Copilot in Windows",
+                )
+                .changed()
+            {
+                let on = self.copilot_enabled;
+                if apply_copilot_enabled(on) {
+                    if on {
+                        self.log_line(
+                            "Microsoft Copilot ON: policy cleared — reinstalling \
+                             the Copilot app (winget, needs internet; this can \
+                             take a few minutes and the app may pause).",
+                        );
+                        let msg = install_copilot_app();
+                        self.log_line(&msg);
+                    } else {
+                        self.log_line(
+                            "Microsoft Copilot OFF: policy set — uninstalling \
+                             the Copilot app (the old policy/button alone does \
+                             not remove the standalone app's taskbar icon).",
+                        );
+                        let msg = uninstall_copilot_app();
+                        self.log_line(&msg);
+                        if unpin_copilot_from_taskbar() {
+                            self.log_line(
+                                "Copilot taskbar pin removed — the pinned \
+                                 Copilot app icon will be gone once Explorer restarts.",
+                            );
+                        } else {
+                            self.log_line(
+                                "No Copilot taskbar pin link found — if the \
+                                 Copilot icon is still on the taskbar, right-click \
+                                 it and choose Unpin from taskbar.",
+                            );
+                        }
+                    }
+                    self.log_line(
+                        "Restarting Explorer so the taskbar picks this up \
+                         (the taskbar will briefly disappear and come back).",
+                    );
+                    let _ = Command::new("taskkill")
+                        .args(["/IM", "explorer.exe", "/F"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _ = Command::new("explorer.exe")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                } else {
+                    self.copilot_enabled = !on;
+                    self.log_line(
+                        "Failed to change the Copilot setting — \
+                         the toggle was left unchanged.",
+                    );
+                }
+            }
+            ui.label(
+                "Turning it off uninstalls the standalone Microsoft \
+                 Copilot app (winget, then AppxPackage) and sets the \
+                 TurnOffWindowsCopilot policy; turning it back on clears \
+                 the policy and reinstalls the app via winget (needs \
+                 internet, can take a few minutes). Applying this restarts \
+                 Explorer — the taskbar will briefly disappear and come back.",
+            );
+            ui.label(
+                "Caveat: this covers the Microsoft Copilot app only, not \
+                 Microsoft 365 Copilot (a different app, left alone). A \
+                 major Windows update can occasionally reset policy keys \
+                 or re-provision the app, so the toggle may need a re-click \
+                 after one of those. Turning it off also removes the \
+                 pinned Copilot icon from the taskbar (best-effort, via \
+                 the pinned-shortcut folder); turning it back on does \
+                 not re-pin it — re-pin from Start if you want it back.",
+            );
+            ui.add_space(6.0);
+            // Reset to WINDOWS defaults — not the user's preferred
+            // settings. Each toggle follows the same revert-on-failure
+            // pattern as its checkbox; Explorer restarts at most
+            // once, at the end, and only if the tray-icons state
+            // actually changed.
+            if ui.button("Reset to defaults").clicked() {
+                let tray_before = self.show_all_tray_icons;
+                self.log_line(
+                    "Resetting Windows Annoyances to Windows defaults \
+                     (not your preferred settings): forced shutdown OFF, \
+                     welcome experience ON, show all tray icons OFF.",
+                );
+                if apply_forced_shutdown(false) {
+                    self.forced_shutdown = false;
+                    self.log_line(
+                        "Forced shutdown reset to OFF (Windows default).",
+                    );
+                } else {
+                    self.log_line(
+                        "Failed to reset forced shutdown — that toggle \
+                         was left unchanged.",
+                    );
+                }
+                if apply_welcome_experience(true) {
+                    self.welcome_experience = true;
+                    self.log_line(
+                        "Welcome experience reset to ON (Windows default: \
+                         the post-update setup screen is allowed again).",
+                    );
+                } else {
+                    self.log_line(
+                        "Failed to reset the welcome experience — that \
+                         toggle was left unchanged.",
+                    );
+                }
+                if apply_show_all_tray_icons(false) {
+                    self.show_all_tray_icons = false;
+                    self.log_line(
+                        "Show all tray icons reset to OFF (Windows \
+                         default: inactive icons hide again).",
+                    );
+                } else {
+                    self.log_line(
+                        "Failed to reset the tray-icons setting — that \
+                         toggle was left unchanged.",
+                    );
+                }
+                if tray_before != self.show_all_tray_icons {
+                    self.log_line(
+                        "Restarting Explorer so the taskbar picks up the \
+                         tray-icons reset (the taskbar will briefly \
+                         disappear and come back).",
+                    );
+                    let _ = Command::new("taskkill")
+                        .args(["/IM", "explorer.exe", "/F"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let _ = Command::new("explorer.exe")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                }
+            }
+            ui.label(
+                "\"Defaults\" here means Windows' own defaults, not your \
+                 preferred settings: forced shutdown OFF, welcome \
+                 experience ON (the post-update setup screen is allowed \
+                 again — that is the Windows default, even though you \
+                 will usually have it off), and show all tray icons OFF. \
+                 If the tray-icons state changed, Explorer restarts once \
+                 so the taskbar picks it up.",
+            );
+        });
+
+    }
+
+    fn section_log(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+            ui.label(egui::RichText::new("Log").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.log)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(24)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            });
+        });
+
+    }
+
+    fn start_update_check(&mut self) {
+        let (tx2, rx2) = mpsc::channel();
+        self.update_rx = Some(rx2);
+        self.update_dismissed = false;
+        self.update_info = None;
+        self.update_status = "Checking\u{2026}".into();
+        self.update_pending = true;
+        thread::spawn(move || check_updates(tx2));
+    }
+
+
 }
 
 impl eframe::App for ClosetApp {
@@ -1396,623 +2308,94 @@ impl eframe::App for ClosetApp {
             None => {}
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::SidePanel::left("nav_panel")
+            .exact_width(210.0)
+            .show(ctx, |ui| {
                 ui.heading("Utility Closet");
-
-                ui.horizontal(|ui| {
-                    if ui.button("Check for updates").clicked() {
-                        let (tx2, rx2) = mpsc::channel();
-                        self.update_rx = Some(rx2);
-                        self.update_dismissed = false;
-                        self.update_info = None;
-                        self.update_status = "Checking…".into();
-                        self.update_pending = true;
-                        thread::spawn(move || check_updates(tx2));
-                    }
-                    if !self.update_status.is_empty() {
-                        ui.label(&self.update_status);
-                    }
-                });
-                ui.add_space(4.0);
-
-                // update banner
-                let upd = self.update_info.clone();
-                if let Some(info) = upd {
-                    if !self.update_dismissed {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Update available: v{} (you have v{APP_VERSION})",
-                                    info.version
-                                ))
-                                .strong(),
-                            );
-                            if self.update_downloading {
-                                let (got_b, total_b) = self.update_progress;
-                                let pct = if total_b > 0 {
-                                    got_b as f32 / total_b as f32 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                ui.label(format!(
-                                    "Downloading… {:.0}% ({:.1} / {:.1} MB)",
-                                    pct,
-                                    got_b as f32 / 1_048_576.0,
-                                    total_b as f32 / 1_048_576.0
-                                ));
-                            } else if ui.button("Download & Install").clicked() {
-                                // Tuya-style: download the installer, run
-                                // it, exit so it can replace us.
-                                self.update_downloading = true;
-                                self.update_progress = (0, info.asset_size);
-                                let (tx2, rx2) = mpsc::channel();
-                                self.update_rx = Some(rx2);
-                                let info2 = info.clone();
-                                thread::spawn(move || download_update(info2, tx2));
-                            }
-                            if ui.button("Dismiss").clicked() {
-                                self.update_dismissed = true;
-                            }
-                        });
+                ui.label(format!("v{APP_VERSION}"));
+                ui.separator();
+                for (label, nav) in [
+                    ("Overview", Nav::Overview),
+                    ("Network Drives", Nav::Drives),
+                    ("Printers", Nav::Printers),
+                    ("Backup & Restore", Nav::Backup),
+                    ("Repairs", Nav::Repairs),
+                    ("Windows Annoyances", Nav::Annoyances),
+                    ("Log", Nav::Log),
+                ] {
+                    if ui.selectable_label(self.nav == nav, label).clicked() {
+                        self.nav = nav;
                     }
                 }
-
-                ui.add_space(4.0);
-
-                // Status at a glance — live state the app already knows,
-                // so you do not have to read the log to see it.
+                ui.separator();
+                if ui.button("Check for updates").clicked() {
+                    self.start_update_check();
+                }
+                if !self.update_status.is_empty() {
+                    ui.label(&self.update_status);
+                }
+                ui.separator();
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                }
+            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        // update banner
+        let upd = self.update_info.clone();
+        if let Some(info) = upd {
+            if !self.update_dismissed {
                 ui.horizontal(|ui| {
-                    let drives_configured = self.drives.iter().filter(|r| !r.path.trim().is_empty()).count();
-                    ui.label(egui::RichText::new(format!(
-                        "Status: {} drive(s) configured \u{00b7} {} printer(s) listed \u{00b7} Forced shutdown {} \u{00b7} Copilot {}",
-                        drives_configured,
-                        self.printers.len(),
-                        if self.forced_shutdown { "on" } else { "off" },
-                        if self.copilot_enabled { "on" } else { "off" },
-                    )).strong());
-                });
-                ui.label("Printer count updates when you click Refresh List in the Printers section.");
-
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    let mut remove_idx: Option<usize> = None;
-                    for (i, row) in self.drives.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut row.letter).desired_width(36.0),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut row.path)
-                                    .desired_width(360.0)
-                                    .hint_text(r"\\SERVER\share"),
-                            );
-                            if ui.button("Remove").clicked() {
-                                remove_idx = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(i) = remove_idx {
-                        self.drives.remove(i);
-                    }
-                    let (mut do_add, mut do_map, mut do_disco) = (false, false, false);
-                    ui.horizontal(|ui| {
-                        do_add = ui.button("Add Drive").clicked();
-                        do_map = ui.button("Map Drives").clicked();
-                        do_disco = ui.button("Disconnect").clicked();
-                    });
-                    if do_add && self.drives.len() < MAX_DRIVES {
-                        self.drives.push(DriveRow {
-                            letter: String::new(),
-                            path: String::new(),
-                        });
-                    }
-                    if do_map {
-                        self.map_drives();
-                    }
-                    if do_disco {
-                        self.disconnect_drives();
-                    }
                     ui.label(
-                        "Paths start blank — enter yours. Add as many drives as you like; \
-                         the list is saved automatically.",
+                        egui::RichText::new(format!(
+                            "Update available: v{} (you have v{APP_VERSION})",
+                            info.version
+                        ))
+                        .strong(),
                     );
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Printers").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    // Bulk-add rows, just like Network Drives: queue up
-                    // paths, then add them all at once.
-                    let mut remove_idx: Option<usize> = None;
-                    for (i, row) in self.printer_rows.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut row.path)
-                                    .desired_width(360.0)
-                                    .hint_text(r"\\SERVER\Printer"),
-                            );
-                            if ui.button("Remove").clicked() {
-                                remove_idx = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(i) = remove_idx {
-                        self.printer_rows.remove(i);
-                    }
-                    let (mut do_add_row, mut do_add_all, mut do_refresh) =
-                        (false, false, false);
-                    ui.horizontal(|ui| {
-                        do_add_row = ui.button("Add Printer").clicked();
-                        do_add_all = ui.button("Add Printers").clicked();
-                        do_refresh = ui.button("Refresh List").clicked();
-                    });
-                    if do_add_row && self.printer_rows.len() < MAX_PRINTERS {
-                        self.printer_rows.push(PrinterRow { path: String::new() });
-                    }
-                    if do_add_all {
-                        self.add_printers();
-                    }
-                    if do_refresh {
-                        self.refresh_printers();
-                    }
-                    if !self.printers.is_empty() {
-                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
-                            for (i, name) in self.printers.iter().enumerate() {
-                                let selected = self.selected_printer == Some(i);
-                                if ui.selectable_label(selected, name).clicked() {
-                                    self.selected_printer = Some(i);
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("Set as Default").clicked() {
-                                self.set_default_printer();
-                            }
-                            if ui.button("Remove Printer").clicked() {
-                                self.remove_printer();
-                            }
-                        });
-                    } else {
-                        ui.label("No printers listed — click Refresh List to load them.");
-                    }
-                    ui.label(
-                        "Queue up printer paths, then Add Printers adds them all at once. \
-                         Select a printer from the list below to set it as default or remove it.",
-                    );
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Backup & Restore").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    ui.horizontal(|ui| {
-                        if ui.button("Export Backup").clicked() {
-                            self.export_backup();
-                        }
-                        if ui.button("Import Backup").clicked() {
-                            self.import_backup();
-                        }
-                        if ui.button("Open Backup Folder").clicked() {
-                            let dir = backup_dir();
-                            let _ = std::fs::create_dir_all(&dir);
-                            let _ = Command::new("explorer.exe")
-                                .arg(dir)
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .spawn();
-                        }
-                    });
-                    ui.label(format!(
-                        "Saves to {}",
-                        backup_file_path().display()
-                    ));
-                    ui.label(
-                        "Export snapshots what is actually on this PC right now: \
-                         mapped network drives, installed printers, and the full \
-                         monitor layout (position, size, primary display) — plus \
-                         any drive/printer rows typed into the app that are not \
-                         currently live. Import maps those drives back, re-adds \
-                         the network printers, and applies the monitor layout to \
-                         displays that are currently connected (missing displays \
-                         are skipped, never forced). Display registry keys are \
-                         also saved as Display-*.reg files in the same folder as \
-                         a fallback.",
-                    );
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("System File Checker").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    ui.horizontal(|ui| {
-                        if ui.button("Run SFC Scan").clicked() {
-                            self.run_sfc();
-                        }
-                        ui.label(
-                            "Scans and repairs protected Windows system files (sfc /scannow). \
-                             Runs in its own window — takes 10-20 minutes.",
-                        );
-                    });
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("DISM — Windows Image Repair").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    ui.horizontal(|ui| {
-                        if ui.button("Check Health").clicked() {
-                            self.run_dism(
-                                &["/Online", "/Cleanup-Image", "/CheckHealth"],
-                                "/Online /Cleanup-Image /CheckHealth",
-                            );
-                        }
-                        if ui.button("Scan Health").clicked() {
-                            self.run_dism(
-                                &["/Online", "/Cleanup-Image", "/ScanHealth"],
-                                "/Online /Cleanup-Image /ScanHealth",
-                            );
-                        }
-                        if ui.button("Restore Health").clicked() {
-                            self.run_dism(
-                                &["/Online", "/Cleanup-Image", "/RestoreHealth"],
-                                "/Online /Cleanup-Image /RestoreHealth",
-                            );
-                        }
-                    });
-                    ui.label(
-                        "Check Health is a quick check for whether the image has \
-                         been flagged as corrupted; Scan Health is a deeper scan \
-                         for component store damage. Restore Health repairs the \
-                         image, downloading replacement files via Windows Update — \
-                         it takes a while (10-20+ minutes) and needs an internet \
-                         connection for the download part. Each runs in its own \
-                         window so you can watch progress.",
-                    );
-                    ui.label(
-                        "This is the same repair as the PowerShell alternative \
-                         (Repair-WindowsImage -Online -RestoreHealth) — no \
-                         separate PowerShell button is needed.",
-                    );
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Display Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    ui.horizontal(|ui| {
-                        if ui.button("Clear & Reset Display Cache").clicked() {
-                            self.confirm = Some(Confirm::DisplayCache);
-                        }
-                        ui.label(
-                            "Deletes the GPU display configuration registry keys. \
-                             You MUST restart your PC afterward.",
-                        );
-                    });
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Icon Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    ui.horizontal(|ui| {
-                        if ui.button("Rebuild Icon Cache").clicked() {
-                            self.confirm = Some(Confirm::IconCache);
-                        }
-                        ui.label(
-                            "Deletes the icon cache and restarts Explorer. \
-                             Save all open work first.",
-                        );
-                    });
-                });
-
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Windows Annoyances").strong().color(egui::Color32::from_rgb(0, 128, 140)),
-                    );
-                    // Applies immediately on click — no separate Apply
-                    // button. If writing the registry fails, revert the
-                    // toggle so it never claims a state it didn't set.
-                    if ui
-                        .checkbox(
-                            &mut self.forced_shutdown,
-                            "Force shutdown / restart (no warning)",
-                        )
-                        .changed()
-                    {
-                        let on = self.forced_shutdown;
-                        if apply_forced_shutdown(on) {
-                            if on {
-                                self.log_line(
-                                    "Forced shutdown ON: Windows will end open apps itself \
-                                     after about 2 seconds instead of showing the \
-                                     \"apps are preventing shutdown\" warning.",
-                                );
-                            } else {
-                                self.log_line(
-                                    "Forced shutdown OFF: Windows will show the \
-                                     \"apps are preventing shutdown\" warning again.",
-                                );
-                            }
+                    if self.update_downloading {
+                        let (got_b, total_b) = self.update_progress;
+                        let pct = if total_b > 0 {
+                            got_b as f32 / total_b as f32 * 100.0
                         } else {
-                            self.forced_shutdown = !on;
-                            self.log_line(
-                                "Failed to change the forced-shutdown setting — \
-                                 the toggle was left unchanged.",
-                            );
-                        }
+                            0.0
+                        };
+                        ui.label(format!(
+                            "Downloading… {:.0}% ({:.1} / {:.1} MB)",
+                            pct,
+                            got_b as f32 / 1_048_576.0,
+                            total_b as f32 / 1_048_576.0
+                        ));
+                    } else if ui.button("Download & Install").clicked() {
+                        // Tuya-style: download the installer, run
+                        // it, exit so it can replace us.
+                        self.update_downloading = true;
+                        self.update_progress = (0, info.asset_size);
+                        let (tx2, rx2) = mpsc::channel();
+                        self.update_rx = Some(rx2);
+                        let info2 = info.clone();
+                        thread::spawn(move || download_update(info2, tx2));
                     }
-                    ui.label(
-                        "Changes what Windows' own Shut down / Restart buttons do: \
-                         with this on, Windows ends blocking apps itself instead of \
-                         stopping at the warning. Applies immediately — no reboot \
-                         needed — and takes effect the next time Windows is told \
-                         to shut down or restart.",
-                    );
-                    ui.label(
-                        "Warning: with this on, unsaved work in open apps can be \
-                         lost, because Windows will no longer stop and ask.",
-                    );
-                    ui.add_space(6.0);
-                    // Same immediate-apply, revert-on-failure pattern as
-                    // the forced-shutdown toggle above.
-                    if ui
-                        .checkbox(
-                            &mut self.welcome_experience,
-                            "Windows welcome experience after updates",
-                        )
-                        .changed()
-                    {
-                        let on = self.welcome_experience;
-                        if apply_welcome_experience(on) {
-                            if on {
-                                self.log_line(
-                                    "Windows welcome experience ON: the post-update \
-                                     setup screen may appear again.",
-                                );
-                            } else {
-                                self.log_line(
-                                    "Windows welcome experience OFF: the post-update \
-                                     setup screen is suppressed.",
-                                );
-                            }
-                        } else {
-                            self.welcome_experience = !on;
-                            self.log_line(
-                                "Failed to change the welcome-experience setting — \
-                                 the toggle was left unchanged.",
-                            );
-                        }
+                    if ui.button("Dismiss").clicked() {
+                        self.update_dismissed = true;
                     }
-                    ui.label(
-                        "This is the white post-update setup screen (\"Let's finish \
-                         setting up your device\" / \"Get even more out of Windows\") \
-                         with OneDrive backup, Microsoft 365, and similar prompts. \
-                         Turning it off suppresses that screen.",
-                    );
-                    ui.label(
-                        "Note: Microsoft can reintroduce new prompts in major \
-                         updates, so this suppresses the current screen rather than \
-                         guaranteeing it never returns in any future form.",
-                    );
-                    ui.add_space(6.0);
-                    // Same immediate-apply, revert-on-failure pattern as
-                    // the toggles above, plus the Explorer restart this
-                    // change needs (same pattern as the icon-cache tool).
-                    if ui
-                        .checkbox(
-                            &mut self.show_all_tray_icons,
-                            "Always show all taskbar tray icons",
-                        )
-                        .changed()
-                    {
-                        let on = self.show_all_tray_icons;
-                        if apply_show_all_tray_icons(on) {
-                            if on {
-                                self.log_line(
-                                    "Show all tray icons ON: notification-area icons \
-                                     will no longer hide in the overflow menu.",
-                                );
-                            } else {
-                                self.log_line(
-                                    "Show all tray icons OFF: Windows will hide \
-                                     inactive tray icons in the overflow menu again.",
-                                );
-                            }
-                            self.log_line(
-                                "Restarting Explorer so the taskbar picks this up \
-                                 (the taskbar will briefly disappear and come back).",
-                            );
-                            let _ = Command::new("taskkill")
-                                .args(["/IM", "explorer.exe", "/F"])
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .status();
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            let _ = Command::new("explorer.exe")
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .spawn();
-                        } else {
-                            self.show_all_tray_icons = !on;
-                            self.log_line(
-                                "Failed to change the tray-icons setting — \
-                                 the toggle was left unchanged.",
-                            );
-                        }
-                    }
-                    ui.label(
-                        "Stops Windows hiding system-tray icons in the overflow \
-                         menu behind the up-arrow, so every notification-area icon \
-                         stays visible on the taskbar. Applying this restarts \
-                         Explorer — the taskbar will briefly disappear and come back.",
-                    );
-                    ui.label(
-                        "Caveat: on Windows 11 some apps' per-app overflow settings \
-                         can still override this, so it is the closest thing to a \
-                         global switch, not a guaranteed override for every app.",
-                    );
-                    ui.add_space(6.0);
-                    // Same immediate-apply, revert-on-failure pattern as
-                    // the toggles above, plus the Explorer restart this
-                    // change needs (same pattern as the tray-icons toggle).
-                    if ui
-                        .checkbox(
-                            &mut self.copilot_enabled,
-                            "Microsoft Copilot in Windows",
-                        )
-                        .changed()
-                    {
-                        let on = self.copilot_enabled;
-                        if apply_copilot_enabled(on) {
-                            if on {
-                                self.log_line(
-                                    "Microsoft Copilot ON: the Copilot policy is \
-                                     cleared and the taskbar Copilot button is shown again.",
-                                );
-                            } else {
-                                self.log_line(
-                                    "Microsoft Copilot OFF: the Copilot policy is \
-                                     set and the taskbar Copilot button is hidden.",
-                                );
-                                if unpin_copilot_from_taskbar() {
-                                    self.log_line(
-                                        "Copilot taskbar pin removed — the pinned \
-                                         Copilot app icon will be gone once Explorer restarts.",
-                                    );
-                                } else {
-                                    self.log_line(
-                                        "No Copilot taskbar pin link found — if the \
-                                         Copilot icon is still on the taskbar, right-click \
-                                         it and choose Unpin from taskbar.",
-                                    );
-                                }
-                            }
-                            self.log_line(
-                                "Restarting Explorer so the taskbar picks this up \
-                                 (the taskbar will briefly disappear and come back).",
-                            );
-                            let _ = Command::new("taskkill")
-                                .args(["/IM", "explorer.exe", "/F"])
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .status();
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            let _ = Command::new("explorer.exe")
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .spawn();
-                        } else {
-                            self.copilot_enabled = !on;
-                            self.log_line(
-                                "Failed to change the Copilot setting — \
-                                 the toggle was left unchanged.",
-                            );
-                        }
-                    }
-                    ui.label(
-                        "Turns the Windows Copilot experience on or off via the \
-                         TurnOffWindowsCopilot policy, and shows or hides the \
-                         taskbar Copilot button to match. Applying this restarts \
-                         Explorer — the taskbar will briefly disappear and come back.",
-                    );
-                    ui.label(
-                        "Caveat: this does not uninstall the standalone Copilot \
-                         app, which stays installed and can still be opened on \
-                         its own; and a major Windows update can occasionally \
-                         reset policy keys, so the toggle may need a re-click \
-                         after one of those. Turning it off also removes the \
-                         pinned Copilot icon from the taskbar (best-effort, via \
-                         the pinned-shortcut folder); turning it back on does \
-                         not re-pin it — re-pin from Start if you want it back.",
-                    );
-                    ui.add_space(6.0);
-                    // Reset to WINDOWS defaults — not the user's preferred
-                    // settings. Each toggle follows the same revert-on-failure
-                    // pattern as its checkbox; Explorer restarts at most
-                    // once, at the end, and only if the tray-icons state
-                    // actually changed.
-                    if ui.button("Reset to defaults").clicked() {
-                        let tray_before = self.show_all_tray_icons;
-                        self.log_line(
-                            "Resetting Windows Annoyances to Windows defaults \
-                             (not your preferred settings): forced shutdown OFF, \
-                             welcome experience ON, show all tray icons OFF.",
-                        );
-                        if apply_forced_shutdown(false) {
-                            self.forced_shutdown = false;
-                            self.log_line(
-                                "Forced shutdown reset to OFF (Windows default).",
-                            );
-                        } else {
-                            self.log_line(
-                                "Failed to reset forced shutdown — that toggle \
-                                 was left unchanged.",
-                            );
-                        }
-                        if apply_welcome_experience(true) {
-                            self.welcome_experience = true;
-                            self.log_line(
-                                "Welcome experience reset to ON (Windows default: \
-                                 the post-update setup screen is allowed again).",
-                            );
-                        } else {
-                            self.log_line(
-                                "Failed to reset the welcome experience — that \
-                                 toggle was left unchanged.",
-                            );
-                        }
-                        if apply_show_all_tray_icons(false) {
-                            self.show_all_tray_icons = false;
-                            self.log_line(
-                                "Show all tray icons reset to OFF (Windows \
-                                 default: inactive icons hide again).",
-                            );
-                        } else {
-                            self.log_line(
-                                "Failed to reset the tray-icons setting — that \
-                                 toggle was left unchanged.",
-                            );
-                        }
-                        if tray_before != self.show_all_tray_icons {
-                            self.log_line(
-                                "Restarting Explorer so the taskbar picks up the \
-                                 tray-icons reset (the taskbar will briefly \
-                                 disappear and come back).",
-                            );
-                            let _ = Command::new("taskkill")
-                                .args(["/IM", "explorer.exe", "/F"])
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .status();
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            let _ = Command::new("explorer.exe")
-                                .creation_flags(CREATE_NO_WINDOW)
-                                .spawn();
-                        }
-                    }
-                    ui.label(
-                        "\"Defaults\" here means Windows' own defaults, not your \
-                         preferred settings: forced shutdown OFF, welcome \
-                         experience ON (the post-update setup screen is allowed \
-                         again — that is the Windows default, even though you \
-                         will usually have it off), and show all tray icons OFF. \
-                         If the tray-icons state changed, Explorer restarts once \
-                         so the taskbar picks it up.",
-                    );
                 });
+            }
+        }
 
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Log").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.log)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(8)
-                                .font(egui::TextStyle::Monospace)
-                                .interactive(false),
-                        );
-                    });
-                });
+        ui.add_space(4.0);
 
-                ui.add_space(6.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("About").clicked() {
-                        self.show_about = true;
-                    }
-                });
-                ui.add_space(8.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                match self.nav {
+                    Nav::Overview => self.section_overview(ui),
+                    Nav::Drives => self.section_drives(ui),
+                    Nav::Printers => self.section_printers(ui),
+                    Nav::Backup => self.section_backup(ui),
+                    Nav::Repairs => self.section_repairs(ui),
+                    Nav::Annoyances => self.section_annoyances(ui),
+                    Nav::Log => self.section_log(ui),
+                }
             });
         });
 
@@ -2094,8 +2477,9 @@ impl eframe::App for ClosetApp {
                              • Windows welcome experience toggle\n\
                              • Always show all tray icons toggle\n\
                              • Windows Annoyances Reset to defaults\n\
-                             • Microsoft Copilot enable/disable toggle\n\
-                             • Backup & restore (drives, printers, monitor layout) to Documents\\Utility Closet"
+                             • Microsoft Copilot enable/disable toggle (off uninstalls the app, on reinstalls it)\n\
+                             • Backup & restore (drives, printers, monitor layout) to Documents\\Utility Closet\n\
+                             • Sidebar navigation + Overview dashboard"
                         ),
                     );
                     ui.add_space(8.0);
@@ -2110,7 +2494,7 @@ impl eframe::App for ClosetApp {
 fn main() {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Utility Closet")
-        .with_inner_size([660.0, 800.0]);
+        .with_inner_size([1040.0, 780.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(Arc::new(icon));
     }
