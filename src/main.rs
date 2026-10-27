@@ -2375,15 +2375,20 @@ $results -join "`n"
     fn section_repairs(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("System File Checker").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-            ui.horizontal(|ui| {
-                if ui.button("Run SFC Scan").clicked() {
-                    self.run_sfc();
-                }
-                ui.label(
-                    "Scans and repairs protected Windows system files (sfc /scannow). \
-                     Runs in its own window — takes 10-20 minutes.",
-                );
-            });
+            // Button on its own row, description below it: a label
+            // in a horizontal row does NOT wrap in egui, so it ran
+            // off the window edge at small widths — and one wide
+            // row forced the whole scroll area wider, clipping even
+            // the normally-wrapped labels. Vertical labels wrap to
+            // whatever width the window is, so every section now
+            // uses this pattern for button + description rows.
+            if ui.button("Run SFC Scan").clicked() {
+                self.run_sfc();
+            }
+            ui.label(
+                "Scans and repairs protected Windows system files (sfc /scannow). \
+                 Runs in its own window — takes 10-20 minutes.",
+            );
         });
 
         ui.add_space(12.0);
@@ -2428,29 +2433,25 @@ $results -join "`n"
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Display Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-            ui.horizontal(|ui| {
-                if ui.button("Clear & Reset Display Cache").clicked() {
-                    self.confirm = Some(Confirm::DisplayCache);
-                }
-                ui.label(
-                    "Deletes the GPU display configuration registry keys. \
-                     You MUST restart your PC afterward.",
-                );
-            });
+            if ui.button("Clear & Reset Display Cache").clicked() {
+                self.confirm = Some(Confirm::DisplayCache);
+            }
+            ui.label(
+                "Deletes the GPU display configuration registry keys. \
+                 You MUST restart your PC afterward.",
+            );
         });
 
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Icon Cache").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-            ui.horizontal(|ui| {
-                if ui.button("Rebuild Icon Cache").clicked() {
-                    self.confirm = Some(Confirm::IconCache);
-                }
-                ui.label(
-                    "Deletes the icon cache and restarts Explorer. \
-                     Save all open work first.",
-                );
-            });
+            if ui.button("Rebuild Icon Cache").clicked() {
+                self.confirm = Some(Confirm::IconCache);
+            }
+            ui.label(
+                "Deletes the icon cache and restarts Explorer. \
+                 Save all open work first.",
+            );
         });
 
     }
@@ -3141,7 +3142,11 @@ impl eframe::App for ClosetApp {
 fn main() {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Utility Closet")
-        .with_inner_size([1040.0, 780.0]);
+        .with_inner_size([1040.0, 780.0])
+        // Floor, not just a starting size: below ~800px wide the
+        // sidebar (210px) plus the drive/printer input rows no
+        // longer fit, so content would clip instead of wrapping.
+        .with_min_inner_size([800.0, 500.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(Arc::new(icon));
     }
