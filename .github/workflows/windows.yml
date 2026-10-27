@@ -24,10 +24,14 @@ jobs:
           # Admin behaviour (egui used a requireAdministrator manifest):
           # patch the generated runner manifest from asInvoker to
           # requireAdministrator, and use the app icon if present.
+          # The old patch silently did nothing when the manifest was
+          # not where expected, shipping asInvoker builds whose
+          # HKLM writes all failed with Access Denied (the Copilot
+          # policy bug) — so patch AND verify, failing loudly.
           $manifest = Get-ChildItem app/windows/runner -Filter *.manifest | Select-Object -First 1
-          if ($manifest) {
-            (Get-Content $manifest.FullName) -replace 'level="asInvoker"', 'level="requireAdministrator"' | Set-Content $manifest.FullName
-          }
+          if (-not $manifest) { throw "no runner manifest found under app/windows/runner" }
+          (Get-Content $manifest.FullName) -replace 'level="asInvoker"', 'level="requireAdministrator"' | Set-Content $manifest.FullName
+          if (-not (Select-String -Path $manifest.FullName -Pattern 'level="requireAdministrator"' -Quiet)) { throw "runner manifest patch failed: requireAdministrator not present" }
           if (Test-Path assets/UtilityCloset.ico) {
             Copy-Item -Force assets/UtilityCloset.ico app/windows/runner/resources/app_icon.ico
           }
@@ -43,6 +47,14 @@ jobs:
           cd app
           flutter pub get
           flutter build windows --release
+      # Prove the built exe really requires elevation: the old
+      # silent asInvoker regression must never ship again.
+      - name: Verify the built exe requiresAdministrator
+        run: |
+          $exe = 'app/build/windows/x64/runner/Release/utility_closet_flutter.exe'
+          $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($text -notmatch 'level="requireAdministrator"') { throw "built exe manifest lacks requireAdministrator" }
+          if ($text -match 'level="asInvoker"') { throw "built exe manifest still asInvoker" }
       - name: Copy Rust core DLL into the Release folder
         run: |
           Copy-Item -Force rust/target/release/utility_closet_core.dll app/build/windows/x64/runner/Release/
