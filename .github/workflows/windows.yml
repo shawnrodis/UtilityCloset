@@ -31,10 +31,12 @@ jobs:
           $manifest = Get-ChildItem app/windows/runner -Filter *.manifest | Select-Object -First 1
           if (-not $manifest) { throw "no runner manifest found under app/windows/runner" }
           Write-Host "MANIFEST-FOUND: $($manifest.FullName)"
-          Get-Content $manifest.FullName | Select-String -Pattern 'requestedExecutionLevel|level=' | ForEach-Object { Write-Host "MANIFEST-LINE: $($_.Line)" }
-          (Get-Content $manifest.FullName) -replace 'level="asInvoker"', 'level="requireAdministrator"' | Set-Content $manifest.FullName
-          Get-Content $manifest.FullName | Select-String -Pattern 'requestedExecutionLevel|level=' | ForEach-Object { Write-Host "PATCHED-LINE: $($_.Line)" }
-          if (-not (Select-String -Path $manifest.FullName -Pattern 'level="requireAdministrator"' -Quiet)) { throw "runner manifest patch failed: requireAdministrator not present" }
+          $raw = Get-Content $manifest.FullName -Raw
+          Write-Host "MANIFEST-LENGTH: $($raw.Length)"
+          Write-Host "MANIFEST-CONTENT-BEGIN"
+          Write-Host $raw
+          Write-Host "MANIFEST-CONTENT-END"
+          throw "diagnostic dump only" 
           if (Test-Path assets/UtilityCloset.ico) {
             Copy-Item -Force assets/UtilityCloset.ico app/windows/runner/resources/app_icon.ico
           }
