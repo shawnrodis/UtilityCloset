@@ -867,6 +867,85 @@ fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
 }
 
+/// Live monitor snapshot, one query for both Detect and Export.
+/// Uses EnumDisplayDevices + EnumDisplaySettings (current mode),
+/// NOT Screen::AllScreens — that only gives Bounds, which hides
+/// rotation: a portrait monitor's Bounds are already swapped, so
+/// a restore that only sets width/height comes back landscape
+/// (or fails) because dmDisplayOrientation is never set. This
+/// query also gives refresh rate, which AllScreens never had.
+/// Fields per display: device, primary, x, y, width, height,
+/// bits, orientation (0=0°, 1=90°, 2=180°, 3=270°), refresh (Hz).
+fn snapshot_monitors() -> Result<Vec<serde_json::Value>, String> {
+    let script = r#"
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class DispSnap {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINTL { public int x; public int y; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DEVMODE {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra; public int dmFields;
+        public short dmOrientation; public short dmPaperSize; public short dmPaperLength; public short dmPaperWidth; public short dmScale; public short dmCopies; public short dmDefaultSource; public short dmPrintQuality;
+        public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+        public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent; public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2; public int dmPanningWidth; public int dmPanningHeight;
+        public POINTL dmPosition;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DISPLAY_DEVICE {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+}
+'@
+Add-Type -TypeDefinition $code
+$out = @()
+for ($i = 0; $true; $i++) {
+    $dd = New-Object DispSnap+DISPLAY_DEVICE; $dd.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($dd)
+    if (-not [DispSnap]::EnumDisplayDevices($null, $i, [ref]$dd, 0)) { break }
+    if (($dd.StateFlags -band 1) -eq 0) { continue }
+    $dm = New-Object DispSnap+DEVMODE; $dm.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($dm)
+    if (-not [DispSnap]::EnumDisplaySettings($dd.DeviceName, -1, [ref]$dm)) { continue }
+    $out += [PSCustomObject]@{
+        DeviceName = $dd.DeviceName; Primary = (($dd.StateFlags -band 4) -ne 0)
+        X = $dm.dmPosition.x; Y = $dm.dmPosition.y
+        Width = $dm.dmPelsWidth; Height = $dm.dmPelsHeight
+        BitsPerPixel = $dm.dmBitsPerPel; Orientation = $dm.dmDisplayOrientation; Refresh = $dm.dmDisplayFrequency
+    }
+}
+$out | ConvertTo-Json -Compress
+"#;
+    let text = run_ps(script)?;
+    let v = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|_| "Could not read monitor layout.".to_string())?;
+    Ok(json_array(v)
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "device": json_str(item, "DeviceName"),
+                "primary": json_bool(item, "Primary"),
+                "x": json_i64(item, "X"),
+                "y": json_i64(item, "Y"),
+                "width": json_i64(item, "Width"),
+                "height": json_i64(item, "Height"),
+                "bits": json_i64(item, "BitsPerPixel"),
+                "orientation": json_i64(item, "Orientation"),
+                "refresh": json_i64(item, "Refresh"),
+            })
+        })
+        .collect())
+}
+
 impl ClosetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(if is_dark_mode() {
@@ -1374,39 +1453,27 @@ impl ClosetApp {
     /// writes Documents\Utility Closet\Monitor-Layout.json so the
     /// layout can be applied on its own, without a full backup.
     fn detect_monitors(&mut self) {
-        match run_ps(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.Screen]::AllScreens | Select-Object DeviceName,Primary, \
-             @{N='X';E={$_.Bounds.X}}, @{N='Y';E={$_.Bounds.Y}}, \
-             @{N='Width';E={$_.Bounds.Width}}, @{N='Height';E={$_.Bounds.Height}}, \
-             @{N='BitsPerPixel';E={$_.BitsPerPixel}} | ConvertTo-Json -Compress",
-        ) {
-            Ok(text) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let monitors: Vec<serde_json::Value> = json_array(v)
-                        .iter()
-                        .map(|item| {
-                            serde_json::json!({
-                                "device": json_str(item, "DeviceName"),
-                                "primary": json_bool(item, "Primary"),
-                                "x": json_i64(item, "X"),
-                                "y": json_i64(item, "Y"),
-                                "width": json_i64(item, "Width"),
-                                "height": json_i64(item, "Height"),
-                                "bits": json_i64(item, "BitsPerPixel"),
-                            })
-                        })
-                        .collect();
+        match snapshot_monitors() {
+            Ok(monitors) => {
                     let mut summary = String::new();
                     for m in &monitors {
+                        let orient = match json_i64(m, "orientation") {
+                            1 => ", 90°",
+                            2 => ", 180°",
+                            3 => ", 270°",
+                            _ => "",
+                        };
+                        let refresh = json_i64(m, "refresh");
                         summary.push_str(&format!(
-                            "{} — {}x{} at ({}, {}){}\n",
+                            "{} — {}x{} at ({}, {}){}{}{}\n",
                             json_str(m, "device"),
                             json_i64(m, "width"),
                             json_i64(m, "height"),
                             json_i64(m, "x"),
                             json_i64(m, "y"),
                             if json_bool(m, "primary") { " (primary)" } else { "" },
+                            orient,
+                            if refresh > 0 { format!(", {refresh} Hz") } else { String::new() },
                         ));
                     }
                     self.monitors_text = summary;
@@ -1428,9 +1495,6 @@ impl ClosetApp {
                             ));
                         }
                     }
-                } else {
-                    self.log_line("Could not read monitor layout.");
-                }
             }
             Err(e) => self.log_line(&format!("Monitor detection failed: {e}")),
         }
@@ -1557,30 +1621,11 @@ impl ClosetApp {
                 "name": path, "port": path, "driver": "", "shared": false, "source": "app",
             }));
         }
-        // Full display topology: screens + video controllers.
+        // Full display topology: monitors (position, size, primary,
+        // orientation, refresh) + video controllers.
         let mut monitors: Vec<serde_json::Value> = Vec::new();
-        match run_ps(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.Screen]::AllScreens | Select-Object DeviceName,Primary, \
-             @{N='X';E={$_.Bounds.X}}, @{N='Y';E={$_.Bounds.Y}}, \
-             @{N='Width';E={$_.Bounds.Width}}, @{N='Height';E={$_.Bounds.Height}}, \
-             @{N='BitsPerPixel';E={$_.BitsPerPixel}} | ConvertTo-Json -Compress",
-        ) {
-            Ok(text) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    for item in json_array(v) {
-                        monitors.push(serde_json::json!({
-                            "device": json_str(&item, "DeviceName"),
-                            "primary": json_bool(&item, "Primary"),
-                            "x": json_i64(&item, "X"),
-                            "y": json_i64(&item, "Y"),
-                            "width": json_i64(&item, "Width"),
-                            "height": json_i64(&item, "Height"),
-                            "bits": json_i64(&item, "BitsPerPixel"),
-                        }));
-                    }
-                }
-            }
+        match snapshot_monitors() {
+            Ok(m) => monitors = m,
             Err(e) => self.log_line(&format!("Monitor snapshot failed: {e}")),
         }
         let mut controllers: Vec<serde_json::Value> = Vec::new();
@@ -1649,7 +1694,8 @@ impl ClosetApp {
     }
 
     /// Apply a backed-up monitor layout live, per display, via
-    /// ChangeDisplaySettingsEx. Displays in the backup that are not
+    /// ChangeDisplaySettingsEx (position, size, primary, orientation,
+    /// refresh rate). Displays in the backup that are not
     /// currently connected are skipped, never forced. The primary
     /// display gets CDS_SET_PRIMARY. Returns nothing; every outcome
     /// is logged, and a total failure leaves the layout unchanged
@@ -1713,6 +1759,8 @@ for ($i = 0; $true; $i++) {{
     $dm.dmPelsWidth = [int]$want.width; $dm.dmPelsHeight = [int]$want.height
     $dm.dmPosition = New-Object Disp+POINTL; $dm.dmPosition.x = [int]$want.x; $dm.dmPosition.y = [int]$want.y
     if ([int]$want.bits -gt 0) {{ $dm.dmFields = $dm.dmFields -bor 0x40000; $dm.dmBitsPerPel = [int]$want.bits }}
+    if ($null -ne $want.orientation) {{ $dm.dmFields = $dm.dmFields -bor 0x80; $dm.dmDisplayOrientation = [short]$want.orientation }}
+    if ([int]$want.refresh -gt 0) {{ $dm.dmFields = $dm.dmFields -bor 0x400000; $dm.dmDisplayFrequency = [int]$want.refresh }}
     $flags = 1 -bor 0x10000000
     if ($want.primary) {{ $flags = $flags -bor 0x10 }}
     $rc = [Disp]::ChangeDisplaySettingsEx($dd.DeviceName, [ref]$dm, [IntPtr]::Zero, $flags, [IntPtr]::Zero)
@@ -2097,7 +2145,7 @@ $results -join "`n"
             ui.label(
                 "Export snapshots what is actually on this PC right now: \
                  mapped network drives, installed printers, and the full \
-                 monitor layout (position, size, primary display) — plus \
+                 monitor layout (position, size, primary display, orientation, refresh rate) — plus \
                  any drive/printer rows typed into the app that are not \
                  currently live. Import maps those drives back, re-adds \
                  the network printers, and applies the monitor layout to \
@@ -2119,7 +2167,7 @@ $results -join "`n"
                 }
             });
             if self.monitors_text.is_empty() {
-                ui.label("Click Detect Monitors to list this PC's displays (device, resolution, position, primary) — that list is what gets backed up and restored.");
+                ui.label("Click Detect Monitors to list this PC's displays (device, resolution, position, primary, orientation, refresh rate) — that list is what gets backed up and restored.");
             } else {
                 ui.label("Detected monitors:");
                 ui.add(
