@@ -3,7 +3,7 @@
 ; Installs to %PROGRAMFILES%\UtilityCloset.
 
 !define APP_NAME "Utility Closet"
-!define APP_VERSION "1.0.11"
+!define APP_VERSION "1.0.12"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/UtilityCloset"
 

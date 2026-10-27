@@ -11,12 +11,85 @@ use std::thread;
 use std::time::Duration;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const MAX_DRIVES: usize = 6;
+const MAX_DRIVES: usize = 12;
 const MAX_PRINTERS: usize = 6;
 
+/// A network row is either a letter-mapped drive (net use) or a
+/// network location: a shortcut in Network Shortcuts that shows up
+/// in This PC under "Network locations" with no drive letter.
+/// `label` is the drive letter for a Drive, the shortcut name for
+/// a Location.
+#[derive(Clone, Copy, PartialEq)]
+enum DriveKind {
+    Drive,
+    Location,
+}
+
 struct DriveRow {
-    letter: String,
+    kind: DriveKind,
+    label: String,
     path: String,
+}
+
+/// Sanitize a network-location shortcut name for use as a file name.
+fn sanitize_location_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "Network Location".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Folder where Windows keeps network-location shortcuts.
+fn network_shortcuts_dir() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|a| {
+            std::path::PathBuf::from(a)
+                .join(r"Microsoft\Windows\Network Shortcuts")
+        })
+}
+
+/// Live network locations on this PC: (shortcut name, UNC target),
+/// resolved from the .lnk files in Network Shortcuts.
+fn collect_network_locations() -> Vec<(String, String)> {
+    match run_ps(
+        "$dir = Join-Path $env:APPDATA 'Microsoft\\Windows\\Network Shortcuts'; \
+         Get-ChildItem $dir -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object { \
+         $s = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName); \
+         [PSCustomObject]@{Name=$_.BaseName; Target=$s.TargetPath} } | ConvertTo-Json -Compress",
+    ) {
+        Ok(text) => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                json_array(v)
+                    .iter()
+                    .filter_map(|item| {
+                        let name = json_str(item, "Name");
+                        let target = json_str(item, "Target");
+                        if name.is_empty() || !target.starts_with(r"\\") {
+                            None
+                        } else {
+                            Some((name, target))
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 struct PrinterRow {
@@ -506,9 +579,34 @@ fn is_copilot_app_installed() -> bool {
     }
 }
 
-/// Uninstall the Copilot app. Winget first (cleanest), then the
-/// AppxPackage route. Returns a human-readable outcome for the log.
+/// Is any Copilot install still present — Store Appx package OR
+/// a Programs and Features entry with DisplayName exactly
+/// "Copilot"? (Microsoft 365 Copilot is a different entry and is
+/// deliberately not counted here.)
+fn copilot_still_present() -> bool {
+    match run_ps(
+        "$appx = Get-AppxPackage -Name 'Microsoft.Copilot*' -ErrorAction SilentlyContinue; \
+         $reg = Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall' -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Copilot' }; \
+         if ($appx -or $reg) { 'yes' } else { 'no' }",
+    ) {
+        Ok(t) => t.trim() == "yes",
+        Err(_) => false,
+    }
+}
+
+/// Uninstall the Copilot app, trying every install form in turn:
+/// Store winget IDs, winget by name (catches Win32 installs),
+/// the Programs and Features UninstallString for the exact
+/// "Copilot" entry (MSI runs quiet; other uninstallers run as-is
+/// so the user can confirm), then AppxPackage. After each attempt
+/// it checks whether Copilot is actually gone before claiming
+/// success — v1.0.11 claimed success from winget's exit code
+/// while a desktop install (e.g. v156.x, 2 GB, in Programs and
+/// Features) was still sitting there.
 fn uninstall_copilot_app() -> String {
+    if !copilot_still_present() {
+        return "Copilot app was not installed.".into();
+    }
     for id in [
         "Microsoft.Copilot_8wekyb3d8bbwe",
         "Microsoft.Copilot",
@@ -524,22 +622,63 @@ fn uninstall_copilot_app() -> String {
             .creation_flags(CREATE_NO_WINDOW)
             .status()
         {
-            if s.success() {
+            if s.success() && !copilot_still_present() {
                 return format!("Copilot app uninstalled via winget ({id}).");
             }
         }
+    }
+    if let Ok(s) = Command::new("winget")
+        .args([
+            "uninstall",
+            "--name",
+            "Copilot",
+            "--silent",
+            "--accept-source-agreements",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+    {
+        if s.success() && !copilot_still_present() {
+            return "Copilot app uninstalled via winget (by name).".into();
+        }
+    }
+    // Programs and Features UninstallString, exact DisplayName only.
+    let ps = r#"
+$keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+foreach ($k in $keys) {
+    $e = Get-ChildItem $k -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'Copilot' } | Select-Object -First 1
+    if ($e -and $e.UninstallString) {
+        $u = $e.UninstallString
+        if ($u -match 'msiexec') {
+            $guid = [regex]::Match($u, '\{[0-9A-Fa-f\-]+\}').Value
+            if ($guid) { Start-Process 'msiexec.exe' -ArgumentList "/X$guid /quiet /norestart" -Wait }
+        } else {
+            Start-Process 'cmd.exe' -ArgumentList "/c `"$u`"" -Wait
+        }
+        break
+    }
+}
+"#;
+    if Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok()
+        && !copilot_still_present()
+    {
+        return "Copilot app uninstalled via its Programs and Features uninstaller.".into();
     }
     match Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
-            "Get-AppxPackage -Name 'Microsoft.Copilot*' | Remove-AppxPackage -ErrorAction Continue; if (Get-AppxPackage -Name 'Microsoft.Copilot*') { exit 1 }",
+            "Get-AppxPackage -Name 'Microsoft.Copilot*' | Remove-AppxPackage -ErrorAction Continue",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .status()
     {
-        Ok(s) if s.success() => "Copilot app uninstalled (AppxPackage).".into(),
-        _ => "Copilot app uninstall did not confirm — it may still be installed; check Settings > Apps.".into(),
+        Ok(_) if !copilot_still_present() => "Copilot app uninstalled (AppxPackage).".into(),
+        _ => "Copilot app uninstall did not confirm — it may still be installed; check Settings > Apps or Programs and Features.".into(),
     }
 }
 
@@ -566,6 +705,22 @@ fn install_copilot_app() -> String {
             if s.success() {
                 return format!("Copilot app reinstalled via winget ({id}).");
             }
+        }
+    }
+    if let Ok(s) = Command::new("winget")
+        .args([
+            "install",
+            "--name",
+            "Copilot",
+            "--silent",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+    {
+        if s.success() {
+            return "Copilot app reinstalled via winget (by name).".into();
         }
     }
     "Copilot app reinstall via winget did not confirm — install it from the Microsoft Store (search 'Microsoft Copilot') if it is still missing.".into()
@@ -780,7 +935,8 @@ impl ClosetApp {
         // Saved drives from load_config() above are left untouched.
         if app.drives.is_empty() {
             app.drives.push(DriveRow {
-                letter: "X".into(),
+                kind: DriveKind::Drive,
+                label: "X".into(),
                 path: String::new(),
             });
         }
@@ -802,22 +958,35 @@ impl ClosetApp {
         }
         let count: usize = map.get("Count").and_then(|s| s.parse().ok()).unwrap_or(0);
         for i in 0..count.min(MAX_DRIVES) {
-            let letter = map
-                .get(&format!("Letter{i}"))
+            // Label{i} is the current key; Letter{i} is the pre-1.0.12
+            // key, kept so old configs still load (as Drives).
+            let label = map
+                .get(&format!("Label{i}"))
+                .or_else(|| map.get(&format!("Letter{i}")))
                 .cloned()
                 .unwrap_or_default();
+            let kind = match map.get(&format!("Kind{i}")).map(|s| s.as_str()) {
+                Some("location") => DriveKind::Location,
+                _ => DriveKind::Drive,
+            };
             let path = map
                 .get(&format!("Path{i}"))
                 .cloned()
                 .unwrap_or_default();
-            self.drives.push(DriveRow { letter, path });
+            self.drives.push(DriveRow { kind, label, path });
         }
     }
 
     fn save_config(&self) {
         let mut s = format!("Count={}\n", self.drives.len());
         for (i, d) in self.drives.iter().enumerate() {
-            s.push_str(&format!("Letter{i}={}\n", d.letter.trim()));
+            let kind = if d.kind == DriveKind::Location {
+                "location"
+            } else {
+                "drive"
+            };
+            s.push_str(&format!("Kind{i}={kind}\n"));
+            s.push_str(&format!("Label{i}={}\n", d.label.trim()));
             s.push_str(&format!("Path{i}={}\n", d.path.trim()));
         }
         let _ = std::fs::write(config_path(), s);
@@ -862,50 +1031,94 @@ impl ClosetApp {
     }
 
     fn map_drives(&mut self) {
-        let rows: Vec<(String, String)> = self
+        let rows: Vec<(DriveKind, String, String)> = self
             .drives
             .iter()
-            .map(|r| (r.letter.clone(), r.path.clone()))
+            .map(|r| (r.kind, r.label.clone(), r.path.clone()))
             .collect();
         let mut mapped = 0;
-        for (letter_raw, path_raw) in &rows {
+        for (kind, label_raw, path_raw) in &rows {
             let path = path_raw.trim();
             if path.is_empty() {
                 continue;
             }
-            match Self::normalized_letter(letter_raw) {
-                Some(letter) => {
-                    self.log_line(&format!("Mapping {letter}: to {path} ..."));
-                    let target = format!("{letter}:");
-                    if self.run_logged("net", &["use", &target, path, "/persistent:yes"]) {
-                        mapped += 1;
+            match kind {
+                DriveKind::Drive => match Self::normalized_letter(label_raw) {
+                    Some(letter) => {
+                        self.log_line(&format!("Mapping {letter}: to {path} ..."));
+                        let target = format!("{letter}:");
+                        if self.run_logged("net", &["use", &target, path, "/persistent:yes"]) {
+                            mapped += 1;
+                        }
                     }
-                }
-                None => {
-                    self.log_line("Skipped: invalid drive letter.");
+                    None => {
+                        self.log_line("Skipped drive row: invalid drive letter.");
+                    }
+                },
+                DriveKind::Location => {
+                    let name = sanitize_location_name(label_raw);
+                    self.log_line(&format!("Adding network location '{name}' -> {path} ..."));
+                    let script = format!(
+                        "$dir = Join-Path $env:APPDATA 'Microsoft\\Windows\\Network Shortcuts'; \
+                         New-Item -ItemType Directory -Force $dir | Out-Null; \
+                         $s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $dir '{name}.lnk')); \
+                         $s.TargetPath = '{path_esc}'; $s.Save()",
+                        name = name.replace('\'', ""),
+                        path_esc = path.replace('\'', ""),
+                    );
+                    match run_ps(&script) {
+                        Ok(_) => {
+                            mapped += 1;
+                            self.log_line(&format!("Network location '{name}' added (This PC > Network locations)."));
+                        }
+                        Err(e) => self.log_line(&format!("Failed to add network location '{name}': {e}")),
+                    }
                 }
             }
         }
         for row in &mut self.drives {
-            if let Some(l) = Self::normalized_letter(&row.letter) {
-                row.letter = l;
+            if row.kind == DriveKind::Drive {
+                if let Some(l) = Self::normalized_letter(&row.label) {
+                    row.label = l;
+                }
             }
         }
         if mapped > 0 {
             self.save_config();
-            self.log_line("Drive list saved for next time.");
+            self.log_line("Network list saved for next time.");
         } else {
             self.log_line(r"Nothing mapped. Enter a network path first (e.g. \\SERVER\share).");
         }
     }
 
     fn disconnect_drives(&mut self) {
-        let rows: Vec<String> = self.drives.iter().map(|r| r.letter.clone()).collect();
-        for letter_raw in rows {
-            if let Some(letter) = Self::normalized_letter(&letter_raw) {
-                self.log_line(&format!("Disconnecting {letter}: ..."));
-                let target = format!("{letter}:");
-                self.run_logged("net", &["use", &target, "/delete", "/y"]);
+        let rows: Vec<(DriveKind, String)> = self
+            .drives
+            .iter()
+            .map(|r| (r.kind, r.label.clone()))
+            .collect();
+        for (kind, label_raw) in rows {
+            match kind {
+                DriveKind::Drive => {
+                    if let Some(letter) = Self::normalized_letter(&label_raw) {
+                        self.log_line(&format!("Disconnecting {letter}: ..."));
+                        let target = format!("{letter}:");
+                        self.run_logged("net", &["use", &target, "/delete", "/y"]);
+                    }
+                }
+                DriveKind::Location => {
+                    let name = sanitize_location_name(&label_raw);
+                    if let Some(dir) = network_shortcuts_dir() {
+                        let link = dir.join(format!("{name}.lnk"));
+                        match std::fs::remove_file(&link) {
+                            Ok(_) => self.log_line(&format!("Removed network location '{name}'.")),
+                            Err(_) => self.log_line(&format!(
+                                "Network location '{name}' shortcut not found at {}.",
+                                link.display()
+                            )),
+                        }
+                    }
+                }
             }
         }
     }
@@ -1093,12 +1306,12 @@ impl ClosetApp {
     /// (Get-SmbMapping), so the app stops looking blank on a PC
     /// that already has drives mapped. Merges by letter, saves.
     fn load_existing_drives(&mut self) {
+        let mut loaded_drives = 0;
         match run_ps(
             "Get-SmbMapping | Select-Object LocalPath,RemotePath | ConvertTo-Json -Compress",
         ) {
             Ok(text) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let mut loaded = 0;
                     for item in json_array(v) {
                         let letter = json_str(&item, "LocalPath")
                             .trim_end_matches(':')
@@ -1108,30 +1321,52 @@ impl ClosetApp {
                             continue;
                         }
                         if let Some(row) = self.drives.iter_mut().find(|r| {
-                            Self::normalized_letter(&r.letter).as_deref() == Some(letter.as_str())
+                            r.kind == DriveKind::Drive
+                                && Self::normalized_letter(&r.label).as_deref() == Some(letter.as_str())
                         }) {
                             row.path = path;
                         } else if self.drives.len() < MAX_DRIVES {
-                            self.drives.push(DriveRow { letter, path });
+                            self.drives.push(DriveRow {
+                                kind: DriveKind::Drive,
+                                label: letter,
+                                path,
+                            });
                         }
-                        loaded += 1;
+                        loaded_drives += 1;
                     }
-                    // Drop blank placeholder rows if real drives
-                    // were loaded (the fresh-start X row).
-                    if loaded > 0 {
-                        let has_real = self.drives.iter().any(|x| !x.path.trim().is_empty());
-                        if has_real {
-                            self.drives.retain(|r| !r.path.trim().is_empty());
-                        }
-                    }
-                    self.save_config();
-                    self.log_line(&format!("Loaded {loaded} existing mapped drive(s) into the list."));
                 } else {
                     self.log_line("Could not read existing mapped drives.");
                 }
             }
             Err(e) => self.log_line(&format!("Failed to list existing mapped drives: {e}")),
         }
+        // Existing network locations (Network Shortcuts shortcuts).
+        let mut loaded_locations = 0;
+        for (name, target) in collect_network_locations() {
+            if self.drives.iter().any(|r| {
+                r.kind == DriveKind::Location && r.path.eq_ignore_ascii_case(&target)
+            }) {
+                continue;
+            }
+            if self.drives.len() < MAX_DRIVES {
+                self.drives.push(DriveRow {
+                    kind: DriveKind::Location,
+                    label: name,
+                    path: target,
+                });
+                loaded_locations += 1;
+            }
+        }
+        if loaded_drives > 0 || loaded_locations > 0 {
+            let has_real = self.drives.iter().any(|x| !x.path.trim().is_empty());
+            if has_real {
+                self.drives.retain(|r| !r.path.trim().is_empty());
+            }
+            self.save_config();
+        }
+        self.log_line(&format!(
+            "Loaded {loaded_drives} existing mapped drive(s) and {loaded_locations} network location(s) into the list."
+        ));
     }
 
     /// Detect the current monitors (full topology, same query as
@@ -1251,20 +1486,41 @@ impl ClosetApp {
             }
             Err(e) => self.log_line(&format!("Live drive snapshot failed ({e}) — app rows only.")),
         }
-        // App drive rows not already live.
+        // App network rows not already live.
         for row in &self.drives {
             let path = row.path.trim();
             if path.is_empty() {
                 continue;
             }
-            let Some(letter) = Self::normalized_letter(&row.letter) else {
-                continue;
-            };
-            if drives.iter().any(|d| json_str(d, "letter") == letter) {
+            match row.kind {
+                DriveKind::Drive => {
+                    let Some(letter) = Self::normalized_letter(&row.label) else {
+                        continue;
+                    };
+                    if drives.iter().any(|d| json_str(d, "letter") == letter) {
+                        continue;
+                    }
+                    drives.push(serde_json::json!({
+                        "kind": "drive", "letter": letter, "label": letter, "path": path, "source": "app", "status": "",
+                    }));
+                }
+                DriveKind::Location => {
+                    if drives.iter().any(|d| json_str(d, "path").eq_ignore_ascii_case(path)) {
+                        continue;
+                    }
+                    drives.push(serde_json::json!({
+                        "kind": "location", "letter": "", "label": row.label, "path": path, "source": "app", "status": "",
+                    }));
+                }
+            }
+        }
+        // Live network locations (Network Shortcuts) not already listed.
+        for (name, target) in collect_network_locations() {
+            if drives.iter().any(|d| json_str(d, "path").eq_ignore_ascii_case(&target)) {
                 continue;
             }
             drives.push(serde_json::json!({
-                "letter": letter, "path": path, "source": "app", "status": "",
+                "kind": "location", "letter": "", "label": name, "path": target, "source": "live", "status": "",
             }));
         }
         // Live installed printers.
@@ -1541,12 +1797,36 @@ $results -join "`n"
             self.drives = drives
                 .iter()
                 .filter_map(|d| {
-                    let letter = json_str(d, "letter");
                     let p = json_str(d, "path");
-                    if letter.is_empty() || p.is_empty() {
-                        None
-                    } else {
-                        Some(DriveRow { letter, path: p })
+                    if p.is_empty() {
+                        return None;
+                    }
+                    // kind defaults to drive for pre-1.0.12 backups.
+                    match json_str(d, "kind").as_str() {
+                        "location" => {
+                            let label = json_str(d, "label");
+                            if label.is_empty() {
+                                None
+                            } else {
+                                Some(DriveRow {
+                                    kind: DriveKind::Location,
+                                    label,
+                                    path: p,
+                                })
+                            }
+                        }
+                        _ => {
+                            let letter = json_str(d, "letter");
+                            if letter.is_empty() {
+                                None
+                            } else {
+                                Some(DriveRow {
+                                    kind: DriveKind::Drive,
+                                    label: letter,
+                                    path: p,
+                                })
+                            }
+                        }
                     }
                 })
                 .take(MAX_DRIVES)
@@ -1599,9 +1879,9 @@ $results -join "`n"
         ui.add_space(8.0);
         let drives_configured = self.drives.iter().filter(|r| !r.path.trim().is_empty()).count();
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-            ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(egui::RichText::new("Network Drives & Locations").strong().color(egui::Color32::from_rgb(0, 128, 140)));
             ui.label(format!("{drives_configured} drive(s) configured in the app."));
-            if ui.button("Open Network Drives").clicked() {
+            if ui.button("Open Network Drives & Locations").clicked() {
                 self.nav = Nav::Drives;
             }
         });
@@ -1649,16 +1929,37 @@ $results -join "`n"
 
     fn section_drives(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
-            ui.label(egui::RichText::new("Network Drives").strong().color(egui::Color32::from_rgb(0, 128, 140)));
+            ui.label(egui::RichText::new("Network Drives & Locations").strong().color(egui::Color32::from_rgb(0, 128, 140)));
             let mut remove_idx: Option<usize> = None;
             for (i, row) in self.drives.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_source(format!("drive_kind{i}"))
+                        .selected_text(if row.kind == DriveKind::Drive {
+                            "Drive"
+                        } else {
+                            "Location"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut row.kind, DriveKind::Drive, "Drive (letter)");
+                            ui.selectable_value(
+                                &mut row.kind,
+                                DriveKind::Location,
+                                "Location (This PC)",
+                            );
+                        });
+                    let (label_width, label_hint) = if row.kind == DriveKind::Drive {
+                        (36.0, "X")
+                    } else {
+                        (140.0, "Name")
+                    };
                     ui.add(
-                        egui::TextEdit::singleline(&mut row.letter).desired_width(36.0),
+                        egui::TextEdit::singleline(&mut row.label)
+                            .desired_width(label_width)
+                            .hint_text(label_hint),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut row.path)
-                            .desired_width(360.0)
+                            .desired_width(320.0)
                             .hint_text(r"\\SERVER\share"),
                     );
                     if ui.button("Remove").clicked() {
@@ -1681,7 +1982,8 @@ $results -join "`n"
             }
             if do_add && self.drives.len() < MAX_DRIVES {
                 self.drives.push(DriveRow {
-                    letter: String::new(),
+                    kind: DriveKind::Drive,
+                    label: String::new(),
                     path: String::new(),
                 });
             }
@@ -1692,10 +1994,13 @@ $results -join "`n"
                 self.disconnect_drives();
             }
             ui.label(
-                "Paths start blank — enter yours. Add as many drives as you like; \
-                 the list is saved automatically. Load Existing pulls in drives \
-                 this PC already has mapped, so the list is never blank when \
-                 the PC already has network drives.",
+                "Drive = a letter-mapped drive (net use, e.g. X:). Location = a \
+                 network location shortcut in This PC > Network locations, with \
+                 no drive letter — just a name and a UNC path. Load Existing pulls \
+                 in both: drives this PC already has mapped and locations it \
+                 already has, so the list is never blank when the PC already \
+                 has network things. Map Drives adds both kinds; Disconnect \
+                 removes both kinds.",
             );
         });
 
@@ -2125,8 +2430,9 @@ $results -join "`n"
                 }
             }
             ui.label(
-                "Turning it off uninstalls the standalone Microsoft \
-                 Copilot app (winget, then AppxPackage) and sets the \
+                "Turning it off uninstalls the Microsoft Copilot app in \
+                 whatever form it is installed — Store app, winget by name, \
+                 or its Programs and Features uninstaller — and sets the \
                  TurnOffWindowsCopilot policy; turning it back on clears \
                  the policy and reinstalls the app via winget (needs \
                  internet, can take a few minutes). Applying this restarts \
@@ -2316,7 +2622,7 @@ impl eframe::App for ClosetApp {
                 ui.separator();
                 for (label, nav) in [
                     ("Overview", Nav::Overview),
-                    ("Network Drives", Nav::Drives),
+                    ("Network Drives & Locations", Nav::Drives),
                     ("Printers", Nav::Printers),
                     ("Backup & Restore", Nav::Backup),
                     ("Repairs", Nav::Repairs),
@@ -2467,7 +2773,7 @@ impl eframe::App for ClosetApp {
                         format!(
                             "Utility Closet v{APP_VERSION}\n\n\
                              All-in-one Windows maintenance:\n\
-                             • Network drive mapping\n\
+                             • Network drive and network location mapping\n\
                              • Printer add/remove\n\
                              • System File Checker (sfc /scannow)\n\
                              • DISM Windows image repair (Check / Scan / Restore Health)\n\
