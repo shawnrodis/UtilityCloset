@@ -1527,6 +1527,47 @@ impl ClosetApp {
             }
             Err(e) => self.log_line(&format!("Failed to list existing mapped drives: {e}")),
         }
+        // Registry fallback — the actual fix for "0 drives" on a
+        // PC that clearly has mapped drives. This app runs as
+        // Administrator, and a mapped drive belongs to the user
+        // session that created it: Get-SmbMapping in an elevated
+        // session sees only that session's mappings, which is
+        // usually none, even though Explorer (standard session)
+        // shows X: and Y: plainly. The mapping definitions
+        // themselves live in HKCU\Network\<letter> with a
+        // RemotePath value, and the same user's hive is readable
+        // from the elevated process — so read those. Only letters
+        // SmbMapping didn't already cover are added (live session
+        // wins if the two ever disagree).
+        if let Ok(text) = run_ps(
+            "Get-ChildItem 'HKCU:\\Network' -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Select-Object @{N='Letter';E={$_.PSChildName}}, RemotePath | ConvertTo-Json -Compress",
+        ) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                for item in json_array(v) {
+                    let Some(letter) = Self::normalized_letter(&json_str(&item, "Letter")) else {
+                        continue;
+                    };
+                    let path = json_str(&item, "RemotePath");
+                    if path.is_empty() {
+                        continue;
+                    }
+                    if self.drives.iter().any(|r| {
+                        r.kind == DriveKind::Drive
+                            && Self::normalized_letter(&r.label).as_deref() == Some(letter.as_str())
+                    }) {
+                        continue;
+                    }
+                    if self.drives.len() < MAX_DRIVES {
+                        self.drives.push(DriveRow {
+                            kind: DriveKind::Drive,
+                            label: letter,
+                            path,
+                        });
+                        loaded_drives += 1;
+                    }
+                }
+            }
+        }
         // Existing network locations (Network Shortcuts shortcuts).
         let mut loaded_locations = 0;
         for (name, target) in collect_network_locations() {
