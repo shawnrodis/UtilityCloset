@@ -47,6 +47,12 @@ jobs:
           }
           Set-Content $manifest.FullName -Value $raw -NoNewline
           if (-not (Select-String -Path $manifest.FullName -Pattern 'level="requireAdministrator"' -Quiet)) { throw "runner manifest patch failed: requireAdministrator not present" }
+          # mt.exe merge conflict: the linker also generates a default
+          # asInvoker trustInfo, and merging it with the file's
+          # requireAdministrator fails (LNK1327, twice). Make the
+          # linker generate requireAdministrator too, so both agree.
+          Add-Content app/windows/runner/CMakeLists.txt 'target_link_options(${BINARY_NAME} PRIVATE "/MANIFESTUAC:level=''requireAdministrator''")'
+          if (-not (Select-String -Path app/windows/runner/CMakeLists.txt -Pattern 'MANIFESTUAC' -Quiet)) { throw "linker UAC flag not appended" }
           if (Test-Path assets/UtilityCloset.ico) {
             Copy-Item -Force assets/UtilityCloset.ico app/windows/runner/resources/app_icon.ico
           }
