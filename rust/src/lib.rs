@@ -156,6 +156,45 @@ fn reg_add(key: &str, name: &str, typ: &str, value: &str) -> bool {
     )
 }
 
+// Debug instrumentation (test builds only — do NOT merge to a
+// release): per-write reg detail for the Copilot/tray applies.
+// The plain apply_* functions collapse two writes into one bool,
+// so a failed toggle/reset cannot say WHICH write failed. These
+// lines are drained into the Log by the reset/toggle paths.
+static LAST_REG_DETAILS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn reg_add_logged(key: &str, name: &str, typ: &str, value: &str) -> bool {
+    let out = new_cmd("reg")
+        .args(["add", key, "/v", name, "/t", typ, "/d", value, "/f"])
+        .output();
+    let (ok, detail) = match out {
+        Ok(o) => {
+            let mut msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if msg.is_empty() {
+                msg = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+            let mut line = msg.lines().next().unwrap_or("").to_string();
+            if line.len() > 240 {
+                line.truncate(240);
+            }
+            (o.status.success(), line)
+        }
+        Err(e) => (false, format!("failed to run reg: {e}")),
+    };
+    if let Ok(mut v) = LAST_REG_DETAILS.lock() {
+        v.push(format!("reg add {key} /v {name} /d {value} -> ok={ok} {detail}"));
+    }
+    ok
+}
+
+fn take_reg_details() -> Vec<String> {
+    match LAST_REG_DETAILS.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn reg_query(key: &str, name: &str) -> Result<String, String> {
     let out = new_cmd("reg")
         .args(["query", key, "/v", name])
@@ -1555,7 +1594,7 @@ fn apply_show_all_tray_icons(on: bool) -> bool {
     ];
     let mut ok = true;
     for (key, name, value) in values {
-        if !reg_add(key, name, "REG_DWORD", value) {
+        if !reg_add_logged(key, name, "REG_DWORD", value) {
             ok = false;
         }
     }
@@ -1578,7 +1617,7 @@ fn apply_copilot_enabled(on: bool) -> bool {
     ];
     let mut ok = true;
     for (key, name, value) in values {
-        if !reg_add(key, name, "REG_DWORD", value) {
+        if !reg_add_logged(key, name, "REG_DWORD", value) {
             ok = false;
         }
     }
@@ -1799,6 +1838,7 @@ fn reset_defaults_vec() -> (Vec<String>, serde_json::Value, bool) {
     } else {
         log.push("Failed to reset the tray-icons setting — that toggle was left unchanged.".to_string());
     }
+    log.extend(take_reg_details());
     // Copilot was the one toggle Reset skipped in older versions:
     // Windows' default is Copilot ON, so Reset now clears the
     // policy, shows the taskbar button again, and reinstalls the
@@ -1810,6 +1850,7 @@ fn reset_defaults_vec() -> (Vec<String>, serde_json::Value, bool) {
     } else {
         log.push("Failed to reset Microsoft Copilot — that toggle was left unchanged.".to_string());
     }
+    log.extend(take_reg_details());
     let states = get_states_value();
     let explorer_restart_needed = tray_before != states["show_all_tray_icons"].as_bool().unwrap_or(false)
         || copilot_before != states["copilot_enabled"].as_bool().unwrap_or(true);
@@ -2241,6 +2282,7 @@ fn apply_toggle_json(
     } else {
         log.push(fail_msg.to_string());
     }
+    log.extend(take_reg_details());
     serde_json::json!({ "ok": ok, "log": log, "states": get_states_value() })
 }
 
