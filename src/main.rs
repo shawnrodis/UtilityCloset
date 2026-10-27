@@ -38,6 +38,7 @@ struct ClosetApp {
     forced_shutdown: bool,
     welcome_experience: bool,
     show_all_tray_icons: bool,
+    copilot_enabled: bool,
     log: String,
     confirm: Option<Confirm>,
     show_about: bool,
@@ -438,6 +439,71 @@ fn apply_show_all_tray_icons(on: bool) -> bool {
     ok
 }
 
+/// Microsoft Copilot in Windows: the "Turn off Windows Copilot"
+/// policy plus the taskbar Copilot button.
+/// OFF (disabled): TurnOffWindowsCopilot=1 (HKLM policy) and
+///   ShowCopilotButton=0 (HKCU taskbar button).
+/// ON (enabled):   TurnOffWindowsCopilot=0 and ShowCopilotButton=1,
+///   so the state is explicit and readable (0 = the policy is not
+///   turning Copilot off, i.e. the Windows default behavior).
+/// On launch, the policy is the read switch: 1 = off, anything else
+/// or missing = on (the Windows default). Needs an Explorer restart
+/// for the taskbar button to update.
+/// Note: this disables the Windows Copilot experience; it does not
+/// uninstall the standalone Copilot app, which stays installed and
+/// can still be opened on its own.
+fn is_copilot_enabled() -> bool {
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot",
+            "/v",
+            "TurnOffWindowsCopilot",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text.lines().find(|l| l.contains("TurnOffWindowsCopilot"));
+            match line.and_then(|l| l.split_whitespace().last()) {
+                Some("1") | Some("0x1") => false,
+                _ => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+fn apply_copilot_enabled(on: bool) -> bool {
+    let (policy, button) = if on { ("0", "1") } else { ("1", "0") };
+    let values = [
+        (
+            r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot",
+            "TurnOffWindowsCopilot",
+            policy,
+        ),
+        (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            "ShowCopilotButton",
+            button,
+        ),
+    ];
+    let mut ok = true;
+    for (key, name, value) in values {
+        let status = Command::new("reg")
+            .args([
+                "add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            ok = false;
+        }
+    }
+    ok
+}
+
 impl ClosetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(if is_dark_mode() {
@@ -453,6 +519,7 @@ impl ClosetApp {
             forced_shutdown: false,
             welcome_experience: true,
             show_all_tray_icons: false,
+            copilot_enabled: true,
             log: String::new(),
             confirm: None,
             show_about: false,
@@ -475,6 +542,7 @@ impl ClosetApp {
         app.forced_shutdown = is_forced_shutdown();
         app.welcome_experience = is_welcome_experience_on();
         app.show_all_tray_icons = is_show_all_tray_icons();
+        app.copilot_enabled = is_copilot_enabled();
         // Fresh start: one blank X row only. If the user wants more
         // drives, the "Add Drive" button adds them — no prefilled Y row.
         // Saved drives from load_config() above are left untouched.
@@ -840,6 +908,22 @@ impl eframe::App for ClosetApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Utility Closet");
+
+                ui.horizontal(|ui| {
+                    if ui.button("Check for updates").clicked() {
+                        let (tx2, rx2) = mpsc::channel();
+                        self.update_rx = Some(rx2);
+                        self.update_dismissed = false;
+                        self.update_info = None;
+                        self.update_status = "Checking…".into();
+                        self.update_pending = true;
+                        thread::spawn(move || check_updates(tx2));
+                    }
+                    if !self.update_status.is_empty() {
+                        ui.label(&self.update_status);
+                    }
+                });
+                ui.add_space(4.0);
 
                 // update banner
                 let upd = self.update_info.clone();
@@ -1220,6 +1304,63 @@ impl eframe::App for ClosetApp {
                          global switch, not a guaranteed override for every app.",
                     );
                     ui.add_space(6.0);
+                    // Same immediate-apply, revert-on-failure pattern as
+                    // the toggles above, plus the Explorer restart this
+                    // change needs (same pattern as the tray-icons toggle).
+                    if ui
+                        .checkbox(
+                            &mut self.copilot_enabled,
+                            "Microsoft Copilot in Windows",
+                        )
+                        .changed()
+                    {
+                        let on = self.copilot_enabled;
+                        if apply_copilot_enabled(on) {
+                            if on {
+                                self.log_line(
+                                    "Microsoft Copilot ON: the Copilot policy is \
+                                     cleared and the taskbar Copilot button is shown again.",
+                                );
+                            } else {
+                                self.log_line(
+                                    "Microsoft Copilot OFF: the Copilot policy is \
+                                     set and the taskbar Copilot button is hidden.",
+                                );
+                            }
+                            self.log_line(
+                                "Restarting Explorer so the taskbar picks this up \
+                                 (the taskbar will briefly disappear and come back).",
+                            );
+                            let _ = Command::new("taskkill")
+                                .args(["/IM", "explorer.exe", "/F"])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            let _ = Command::new("explorer.exe")
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .spawn();
+                        } else {
+                            self.copilot_enabled = !on;
+                            self.log_line(
+                                "Failed to change the Copilot setting — \
+                                 the toggle was left unchanged.",
+                            );
+                        }
+                    }
+                    ui.label(
+                        "Turns the Windows Copilot experience on or off via the \
+                         TurnOffWindowsCopilot policy, and shows or hides the \
+                         taskbar Copilot button to match. Applying this restarts \
+                         Explorer — the taskbar will briefly disappear and come back.",
+                    );
+                    ui.label(
+                        "Caveat: this does not uninstall the standalone Copilot \
+                         app, which stays installed and can still be opened on \
+                         its own; and a major Windows update can occasionally \
+                         reset policy keys, so the toggle may need a re-click \
+                         after one of those.",
+                    );
+                    ui.add_space(6.0);
                     // Reset to WINDOWS defaults — not the user's preferred
                     // settings. Each toggle follows the same revert-on-failure
                     // pattern as its checkbox; Explorer restarts at most
@@ -1309,24 +1450,10 @@ impl eframe::App for ClosetApp {
                 });
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Check for updates").clicked() {
-                        let (tx2, rx2) = mpsc::channel();
-                        self.update_rx = Some(rx2);
-                        self.update_dismissed = false;
-                        self.update_info = None;
-                        self.update_status = "Checking…".into();
-                        self.update_pending = true;
-                        thread::spawn(move || check_updates(tx2));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("About").clicked() {
+                        self.show_about = true;
                     }
-                    if !self.update_status.is_empty() {
-                        ui.label(&self.update_status);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("About").clicked() {
-                            self.show_about = true;
-                        }
-                    });
                 });
                 ui.add_space(8.0);
             });
@@ -1409,8 +1536,8 @@ impl eframe::App for ClosetApp {
                              • Forced shutdown toggle\n\
                              • Windows welcome experience toggle\n\
                              • Always show all tray icons toggle\n\
-                             • Windows Annoyances Reset to defaults\n\n\
-                             Built for Shawn Rodis."
+                             • Windows Annoyances Reset to defaults\n\
+                             • Microsoft Copilot enable/disable toggle"
                         ),
                     );
                     ui.add_space(8.0);
