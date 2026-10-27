@@ -1106,6 +1106,10 @@ impl ClosetApp {
         // a live drive/location row only hides it until the next
         // launch; use Disconnect to actually remove it.
         app.load_existing_drives();
+        // Same for printers: the Overview count and the Printers
+        // list must reflect what's actually installed when the
+        // app opens, not wait for a manual Refresh List click.
+        app.refresh_printers();
         // Forced-shutdown toggle reflects the real registry state, not
         // a saved setting (another tool could have changed it).
         app.forced_shutdown = is_forced_shutdown();
@@ -2040,7 +2044,7 @@ $results -join "`n"
         ui.add_space(12.0);
         egui::Frame::group(ui.style()).rounding(egui::Rounding::same(12.0)).inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
             ui.label(egui::RichText::new("Printers").strong().color(egui::Color32::from_rgb(0, 128, 140)));
-            ui.label(format!("{} printer(s) listed (Refresh List updates this).", self.printers.len()));
+            ui.label(format!("{} printer(s) installed (loaded on launch; Refresh List re-scans).", self.printers.len()));
             ui.horizontal(|ui| {
                 if ui.button("Refresh List").clicked() {
                     self.refresh_printers();
@@ -2215,7 +2219,7 @@ $results -join "`n"
                     }
                 });
             } else {
-                ui.label("No printers listed — click Refresh List to load them.");
+                ui.label("No printers installed on this PC (list loaded on launch; Refresh List re-scans).");
             }
             ui.label(
                 "Queue up printer paths, then Add Printers adds them all at once. \
