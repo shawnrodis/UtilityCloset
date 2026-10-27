@@ -1,8 +1,10 @@
 # The Utility Closet
 
-An all-in-one Windows maintenance app: network drive mapping, System File
-Checker, display cache reset, and icon cache rebuild — in one window,
-no bloat.
+An all-in-one Windows maintenance app: network drive mapping, bulk printer
+setup, backup and restore of drives, printers and monitor layout, System
+File Checker and Windows image repair, display cache reset, and icon cache
+rebuild — plus switches for common Windows annoyances — in one window,
+no bloat, no command line needed.
 
 Built with [Rust](https://www.rust-lang.org/) (core logic) and
 [Flutter](https://flutter.dev/) (UI), RustDesk-style: the Rust core
