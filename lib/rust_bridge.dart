@@ -178,15 +178,15 @@ class RustBridge {
   static Future<Map<String, dynamic>> resetDefaults() =>
       _isoNoArg('uc_reset_defaults');
 
-  static Future<Map<String, dynamic>> checkUpdate() =>
-      _isoNoArg('uc_check_update');
+  static Future<Map<String, dynamic>> checkUpdate(String currentVersion) =>
+      _iso('uc_check_update', jsonEncode({'current_version': currentVersion}));
 
   static Future<void> openBackupFolder() async {
     await _isoNoArg('uc_open_backup_folder');
   }
 
-  static Future<void> launchInstaller(String path) async {
-    await _iso('uc_launch_installer', jsonEncode({'path': path}));
+  static Future<Map<String, dynamic>> launchInstaller(String path) async {
+    return await _iso('uc_launch_installer', jsonEncode({'path': path}));
   }
 
   static String version() => _callNoArg('uc_version');

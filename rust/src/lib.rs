@@ -52,7 +52,7 @@ use std::time::Duration;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MAX_DRIVES: usize = 12;
 const MAX_PRINTERS: usize = 6;
-const APP_VERSION: &str = "1.1.0";
+const APP_VERSION: &str = "1.1.2";
 const UPDATE_REPO: &str = "shawnrodis/UtilityCloset";
 const DESKTOP_KEY: &str = r"HKCU\Control Panel\Desktop";
 
@@ -1839,7 +1839,7 @@ fn expected_asset_name(version: &str) -> String {
     format!("UtilityCloset-Setup-v{version}.exe")
 }
 
-fn check_update_value() -> serde_json::Value {
+fn check_update_value(current_version: &str) -> serde_json::Value {
     let failed = || serde_json::json!({ "available": false, "status": "check_failed" });
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -1863,7 +1863,7 @@ fn check_update_value() -> serde_json::Value {
     if tag.is_empty() {
         return failed();
     }
-    if parse_ver(&tag) <= parse_ver(APP_VERSION) {
+    if parse_ver(&tag) <= parse_ver(current_version) {
         return serde_json::json!({
             "available": false,
             "status": "up_to_date",
@@ -1994,7 +1994,7 @@ pub extern "C" fn uc_free_string(ptr: *mut c_char) {
 
 #[no_mangle]
 pub extern "C" fn uc_version() -> *mut c_char {
-    string_to_ptr("1.1.0-rust".to_string())
+    string_to_ptr("1.1.2-rust".to_string())
 }
 
 #[no_mangle]
@@ -2330,8 +2330,18 @@ pub extern "C" fn uc_reset_defaults(_input: *const c_char) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn uc_check_update(_input: *const c_char) -> *mut c_char {
-    json_ptr(check_update_value())
+pub extern "C" fn uc_check_update(input: *const c_char) -> *mut c_char {
+    // Single source of truth is the UI's displayed version, passed in
+    // by Dart. Fall back to the Rust const only if Dart sends nothing,
+    // so a missed Rust bump can never again report a same-version
+    // update (v1.1.1 bug: Rust was still 1.1.0 while Dart was 1.1.1).
+    let text = cstr_to_string(input);
+    let current = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("current_version").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| APP_VERSION.to_string());
+    json_ptr(check_update_value(&current))
 }
 
 #[no_mangle]
@@ -2349,9 +2359,25 @@ pub extern "C" fn uc_open_backup_folder(_input: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn uc_launch_installer(input: *const c_char) -> *mut c_char {
     let path = parse_name_input(&cstr_to_string(input));
-    let ok = new_cmd(&path).spawn().is_ok();
-    // The caller exits after launching (Tuya-style: the installer
-    // handles the upgrade and replaces the running app).
+    // Do NOT run the installer directly: it would try to replace the
+    // running app exe while it is still locked, and the app exits
+    // immediately after this call. Instead write a tiny .bat that waits
+    // 2s (app fully closed by then), runs the installer, then deletes
+    // itself. The .bat survives the app exit because cmd owns it.
+    let bat = std::env::temp_dir().join("UtilityCloset-update.bat");
+    let clean_path = path.replace('"', "");
+    let mut bat_text = String::from("@echo off\r\n");
+    bat_text.push_str("timeout /t 2 /nobreak >nul\r\n");
+    bat_text.push_str("start \"\" \"");
+    bat_text.push_str(&clean_path);
+    bat_text.push_str("\"\r\n");
+    bat_text.push_str("del \"%~f0\"\r\n");
+    let ok = std::fs::write(&bat, bat_text).is_ok()
+        && new_cmd("cmd")
+            .arg("/C")
+            .arg(bat.to_string_lossy().as_ref())
+            .spawn()
+            .is_ok();
     json_ptr(serde_json::json!({ "ok": ok, "path": path }))
 }
 
@@ -2431,7 +2457,7 @@ mod tests {
         let doc = backup_doc(vec![], vec![], monitors.clone(), vec![]);
         assert_eq!(doc["format"], "UtilityClosetBackup");
         assert_eq!(doc["version"], 1);
-        assert_eq!(doc["app_version"], "1.1.0");
+        assert_eq!(doc["app_version"], "1.1.2");
         assert_eq!(doc["monitors"][0]["device"], r"\\.\DISPLAY1");
         // Summary lines match the egui format.
         let summary = monitor_summary(&monitors);

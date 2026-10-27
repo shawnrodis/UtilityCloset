@@ -28,7 +28,7 @@ import 'package:http/http.dart' as http;
 
 import 'rust_bridge.dart';
 
-const String appVersion = '1.1.1';
+const String appVersion = '1.1.2';
 const Color teal = Color(0xFF00808C);
 
 void main() {
@@ -207,7 +207,7 @@ class _ClosetHomeState extends State<ClosetHome> {
   Future<void> _checkUpdates({bool silent = false}) async {
     if (!silent) setState(() => _updateStatus = 'Checking…');
     try {
-      final r = await RustBridge.checkUpdate();
+      final r = await RustBridge.checkUpdate(appVersion);
       if (r['available'] == true) {
         setState(() {
           _updateInfo = r;
@@ -245,6 +245,7 @@ class _ClosetHomeState extends State<ClosetHome> {
     });
     try {
       final req = await http.Client().send(http.Request('GET', Uri.parse(url)));
+      if (req.statusCode != 200) throw StateError('HTTP ${req.statusCode}');
       final total = req.contentLength ?? (info['asset_size'] as int? ?? 0);
       final chunks = <int>[];
       var got = 0;
@@ -253,10 +254,22 @@ class _ClosetHomeState extends State<ClosetHome> {
         got += chunk.length;
         if (total > 0) setState(() => _updateProgress = got / total);
       }
+      // Verify before launching: a redirect/error page or truncated file
+      // must never be run as an installer, and must never exit the app.
+      if (chunks.isEmpty ||
+          chunks.length < 2 ||
+          chunks[0] != 0x4D ||
+          chunks[1] != 0x5A ||
+          (total > 0 && got != total)) {
+        throw StateError('Download verification failed');
+      }
       final dest = File('${Directory.systemTemp.path}\\$name');
       await dest.writeAsBytes(chunks);
       setState(() => _updateStatus = 'Downloaded $name — launching installer…');
-      await RustBridge.launchInstaller(dest.path);
+      final launched = await RustBridge.launchInstaller(dest.path);
+      if (launched['ok'] != true) throw StateError('Installer launch failed');
+      // The launcher waits 2s before running the installer, so the app
+      // is fully closed before the installer tries to replace it.
       exit(0);
     } catch (_) {
       setState(() {
