@@ -23,6 +23,18 @@ installer is admin, and the Windows runner manifest is patched to
   <img src="assets/screenshot-v1.1.2.png" alt="The Utility Closet main window" width="520">
 </p>
 
+<p align="center">
+  <img src="assets/screenshot-overview.png" alt="The Utility Closet Overview tab: network drives, printers, backup, and Windows annoyances at a glance" width="520">
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-repairs.png" alt="The Utility Closet Repairs tab: System File Checker, DISM image repair, display cache, and icon cache" width="520">
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-annoyances.png" alt="The Utility Closet Windows Annoyances tab: forced shutdown, instant close, welcome experience, tray icons, and Copilot toggles" width="520">
+</p>
+
 ## Download
 
 Grab the latest `UtilityCloset-Setup-vX.Y.Z.exe` installer from
